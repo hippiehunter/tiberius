@@ -1,0 +1,182 @@
+//! Server entrypoint for the TDS server.
+
+use std::time::{Duration, Instant};
+
+use futures_util::stream::StreamExt;
+
+use crate::server::backend::NetStream;
+use crate::server::connection::TdsConnection;
+use crate::server::handler::{
+    AttentionHandler, AuthHandler, BulkLoadHandler, ErrorHandler, RpcHandler, SqlBatchHandler,
+    TdsClientInfo, TdsServerHandlers,
+};
+use crate::server::messages::TdsFrontendMessage;
+use crate::server::state::TdsConnectionState;
+use crate::server::tls::{MaybeTlsStream, NoTls, TlsAccept};
+use crate::Error;
+use crate::EncryptionLevel;
+
+/// Default startup timeout (60 seconds).
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+type ServerStream<S, T> = MaybeTlsStream<S, <T as TlsAccept>::Stream<S>>;
+
+/// Process a TDS connection over any NetStream backend.
+pub async fn process_connection<S, T, H>(
+    stream: S,
+    tls_acceptor: Option<T>,
+    handlers: &H,
+) -> Result<(), Error>
+where
+    S: NetStream,
+    T: TlsAccept,
+    H: TdsServerHandlers,
+{
+    let stream = MaybeTlsStream::new_raw(stream);
+    let mut conn: TdsConnection<ServerStream<S, T>> = TdsConnection::new(stream);
+
+    let startup_deadline = Instant::now() + STARTUP_TIMEOUT;
+    let auth_handler = handlers.auth_handler();
+    let sql_batch_handler = handlers.sql_batch_handler();
+    let rpc_handler = handlers.rpc_handler();
+    let bulk_load_handler = handlers.bulk_load_handler();
+    let attention_handler = handlers.attention_handler();
+    let error_handler = handlers.error_handler();
+
+    loop {
+        if matches!(
+            conn.state(),
+            TdsConnectionState::AwaitingPrelogin
+                | TdsConnectionState::AwaitingLogin
+                | TdsConnectionState::AuthenticationInProgress
+        ) {
+            if Instant::now() > startup_deadline {
+                return Err(Error::Protocol("startup timeout exceeded".into()));
+            }
+        }
+
+        let msg = match conn.next().await {
+            Some(Ok(msg)) => msg,
+            Some(Err(e)) => {
+                let mut err = Error::Protocol(e.to_string().into());
+                error_handler.on_error(&conn, &mut err);
+                return Err(e);
+            }
+            None => return Ok(()),
+        };
+
+        let result = dispatch_message(
+            &mut conn,
+            msg,
+            auth_handler,
+            sql_batch_handler,
+            rpc_handler,
+            bulk_load_handler,
+            attention_handler,
+            &tls_acceptor,
+        )
+        .await;
+
+        if let Err(e) = result {
+            let mut err = Error::Protocol(e.to_string().into());
+            error_handler.on_error(&conn, &mut err);
+            return Err(e);
+        }
+    }
+}
+
+async fn dispatch_message<S, T, AH, SH, RH, BH, AT>(
+    conn: &mut TdsConnection<ServerStream<S, T>>,
+    msg: TdsFrontendMessage,
+    auth_handler: &AH,
+    sql_batch_handler: &SH,
+    rpc_handler: &RH,
+    bulk_load_handler: &BH,
+    attention_handler: &AT,
+    tls_acceptor: &Option<T>,
+) -> Result<(), Error>
+where
+    S: NetStream,
+    T: TlsAccept,
+    AH: AuthHandler,
+    SH: SqlBatchHandler,
+    RH: RpcHandler,
+    BH: BulkLoadHandler,
+    AT: AttentionHandler,
+{
+    match (conn.state(), msg) {
+        (TdsConnectionState::AwaitingPrelogin, TdsFrontendMessage::Prelogin(message)) => {
+            auth_handler.on_prelogin(conn, message).await?;
+            maybe_upgrade_tls(conn, tls_acceptor).await
+        }
+        (TdsConnectionState::AwaitingLogin, TdsFrontendMessage::Login(message)) => {
+            maybe_downgrade_tls::<S, T>(conn)?;
+            auth_handler.on_login(conn, message).await
+        }
+        (TdsConnectionState::ReadyForQuery, TdsFrontendMessage::SqlBatch(batch)) => {
+            sql_batch_handler.on_sql_batch(conn, batch).await
+        }
+        (TdsConnectionState::ReadyForQuery, TdsFrontendMessage::Rpc(message)) => {
+            rpc_handler.on_rpc(conn, message).await
+        }
+        (TdsConnectionState::BulkLoadInProgress, TdsFrontendMessage::BulkLoad(payload)) => {
+            bulk_load_handler.on_bulk_load(conn, payload).await
+        }
+        (_, TdsFrontendMessage::Attention) => attention_handler.on_attention(conn).await,
+        _ => Err(Error::Protocol("unexpected message for state".into())),
+    }
+}
+
+async fn maybe_upgrade_tls<S, T>(
+    conn: &mut TdsConnection<ServerStream<S, T>>,
+    tls_acceptor: &Option<T>,
+) -> Result<(), Error>
+where
+    S: NetStream,
+    T: TlsAccept,
+{
+    match conn.encryption() {
+        EncryptionLevel::NotSupported => Ok(()),
+        _ => {
+            let Some(acceptor) = tls_acceptor.as_ref() else {
+                return Err(Error::Protocol("TLS requested but no acceptor configured".into()));
+            };
+
+            if conn.is_secure() {
+                return Ok(());
+            }
+
+            let raw = conn
+                .stream_mut()
+                .take_raw()
+                .ok_or_else(|| Error::Protocol("TLS upgrade requires a raw stream".into()))?;
+            let tls_stream = acceptor.accept(raw).await?;
+            conn.stream_mut().set_tls(tls_stream);
+            conn.set_secure(true);
+            Ok(())
+        }
+    }
+}
+
+fn maybe_downgrade_tls<S, T>(conn: &mut TdsConnection<ServerStream<S, T>>) -> Result<(), Error>
+where
+    S: NetStream,
+    T: TlsAccept,
+{
+    if conn.encryption() == EncryptionLevel::Off && conn.is_secure() {
+        conn.stream_mut().downgrade()?;
+        conn.set_secure(false);
+    }
+
+    Ok(())
+}
+
+/// Helper for callers that do not support TLS.
+pub async fn process_connection_no_tls<S, H>(stream: S, handlers: &H) -> Result<(), Error>
+where
+    S: NetStream,
+    H: TdsServerHandlers,
+{
+    let tls: Option<NoTls> = None;
+    process_connection(stream, tls, handlers).await
+}
