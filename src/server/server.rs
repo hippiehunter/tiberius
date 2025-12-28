@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 
 use futures_util::stream::StreamExt;
+use futures_util::SinkExt;
 
 use crate::server::backend::NetStream;
 use crate::server::connection::TdsConnection;
@@ -10,9 +11,10 @@ use crate::server::handler::{
     AttentionHandler, AuthHandler, BulkLoadHandler, ErrorHandler, RpcHandler, SqlBatchHandler,
     TdsClientInfo, TdsServerHandlers,
 };
-use crate::server::messages::TdsFrontendMessage;
+use crate::server::messages::{AllHeaders, BackendToken, TdsBackendMessage, TdsFrontendMessage};
 use crate::server::state::TdsConnectionState;
 use crate::server::tls::{MaybeTlsStream, NoTls, TlsAccept};
+use crate::tds::codec::{DoneStatus, TokenDone};
 use crate::Error;
 use crate::EncryptionLevel;
 
@@ -113,17 +115,53 @@ where
             maybe_downgrade_tls::<S, T>(conn)?;
             auth_handler.on_login(conn, message).await
         }
-        (TdsConnectionState::ReadyForQuery, TdsFrontendMessage::SqlBatch(batch)) => {
-            sql_batch_handler.on_sql_batch(conn, batch).await
+        (TdsConnectionState::AuthenticationInProgress, TdsFrontendMessage::Sspi(token)) => {
+            auth_handler.on_sspi(conn, token).await
+        }
+        (TdsConnectionState::ReadyForQuery, TdsFrontendMessage::SqlBatch(message)) => {
+            conn.clear_attention();
+            apply_request_headers::<S, T>(conn, &message.headers, message.request_flags);
+            sql_batch_handler.on_sql_batch(conn, message).await
         }
         (TdsConnectionState::ReadyForQuery, TdsFrontendMessage::Rpc(message)) => {
+            conn.clear_attention();
+            apply_request_headers::<S, T>(conn, &message.headers, message.request_flags);
             rpc_handler.on_rpc(conn, message).await
         }
         (TdsConnectionState::BulkLoadInProgress, TdsFrontendMessage::BulkLoad(payload)) => {
+            conn.clear_attention();
             bulk_load_handler.on_bulk_load(conn, payload).await
         }
-        (_, TdsFrontendMessage::Attention) => attention_handler.on_attention(conn).await,
+        (_, TdsFrontendMessage::Attention) => {
+            conn.mark_attention();
+            attention_handler.on_attention(conn).await?;
+            if conn.attention_pending() {
+                let done = TokenDone::with_status(DoneStatus::Attention.into(), 0);
+                conn.send(TdsBackendMessage::Token(BackendToken::Done(done)))
+                    .await?;
+                conn.clear_attention();
+                conn.set_state(TdsConnectionState::ReadyForQuery);
+            }
+            Ok(())
+        }
         _ => Err(Error::Protocol("unexpected message for state".into())),
+    }
+}
+
+fn apply_request_headers<S, T>(
+    conn: &mut TdsConnection<ServerStream<S, T>>,
+    headers: &AllHeaders,
+    request_flags: crate::server::messages::RequestFlags,
+)
+where
+    S: NetStream,
+    T: TlsAccept,
+{
+    if let Some(tx) = headers.transaction_descriptor.as_ref() {
+        conn.set_transaction_descriptor(tx.descriptor);
+    }
+    if request_flags.reset_connection || request_flags.reset_connection_skip_tran {
+        conn.mark_reset_connection(request_flags.reset_connection_skip_tran);
     }
 }
 

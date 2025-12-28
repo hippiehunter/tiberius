@@ -8,6 +8,7 @@ use futures_util::sink::Sink;
 use crate::EncryptionLevel;
 use crate::server::messages::TdsBackendMessage;
 use crate::server::state::TdsConnectionState;
+use crate::tds::codec::FeatureLevel;
 use crate::Result;
 
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -23,10 +24,20 @@ pub trait TdsClientInfo {
     fn next_packet_id(&mut self) -> u8;
     fn packet_size(&self) -> u32;
     fn set_packet_size(&mut self, size: u32);
+    fn tds_version(&self) -> FeatureLevel;
+    fn set_tds_version(&mut self, version: FeatureLevel);
     fn transaction_descriptor(&self) -> [u8; 8];
     fn set_transaction_descriptor(&mut self, desc: [u8; 8]);
     fn encryption(&self) -> EncryptionLevel;
     fn set_encryption(&mut self, encryption: EncryptionLevel);
+    /// True if a cancel/attention has been observed.
+    fn attention_pending(&self) -> bool;
+    /// Clear the cancel/attention flag.
+    fn clear_attention(&mut self);
+    /// Poll the wire for an attention signal while inside a handler.
+    fn poll_attention<'a>(&'a mut self) -> BoxFuture<'a, Result<bool>>
+    where
+        Self: Sized;
 }
 
 /// Authentication and handshake handling.
@@ -54,6 +65,25 @@ pub trait AuthHandler: Send + Sync {
             + Unpin
             + Send
             + 'a;
+
+    fn on_sspi<'a, C>(
+        &'a self,
+        _client: &'a mut C,
+        _token: crate::tds::codec::TokenSspi,
+    ) -> BoxFuture<'a, Result<()>>
+    where
+        C: TdsClientInfo
+            + Sink<TdsBackendMessage, Error = crate::Error>
+            + Unpin
+            + Send
+            + 'a,
+    {
+        Box::pin(async {
+            Err(crate::Error::Protocol(
+                "SSPI message not supported by this auth handler".into(),
+            ))
+        })
+    }
 }
 
 /// SQL batch handler (simple query flow).
@@ -61,7 +91,7 @@ pub trait SqlBatchHandler: Send + Sync {
     fn on_sql_batch<'a, C>(
         &'a self,
         client: &'a mut C,
-        batch: String,
+        message: crate::server::messages::SqlBatchMessage,
     ) -> BoxFuture<'a, Result<()>>
     where
         C: TdsClientInfo

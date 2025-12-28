@@ -2,8 +2,9 @@ use crate::tds::codec::TokenSspi;
 use crate::{
     client::Connection,
     tds::codec::{
-        TokenColMetaData, TokenDone, TokenEnvChange, TokenError, TokenFeatureExtAck, TokenInfo,
-        TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow,
+        TokenAltMetaData, TokenAltRow, TokenColInfo, TokenColMetaData, TokenColName, TokenDone,
+        TokenEnvChange, TokenError, TokenFeatureExtAck, TokenFedAuthInfo, TokenInfo,
+        TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow, TokenSessionState, TokenTabName,
     },
     Error, SqlReadBytes, TokenType,
 };
@@ -19,17 +20,24 @@ use tracing::{event, Level};
 pub enum ReceivedToken {
     NewResultset(Arc<TokenColMetaData<'static>>),
     Row(TokenRow<'static>),
+    AltMetaData(Arc<TokenAltMetaData<'static>>),
+    AltRow(TokenAltRow<'static>),
     Done(TokenDone),
     DoneInProc(TokenDone),
     DoneProc(TokenDone),
     ReturnStatus(u32),
     ReturnValue(TokenReturnValue),
     Order(TokenOrder),
+    ColName(TokenColName),
+    TabName(TokenTabName),
+    ColInfo(TokenColInfo),
     EnvChange(TokenEnvChange),
     Info(TokenInfo),
     LoginAck(TokenLoginAck),
     Sspi(TokenSspi),
     FeatureExtAck(TokenFeatureExtAck),
+    SessionState(TokenSessionState),
+    FedAuthInfo(TokenFedAuthInfo),
     Error(TokenError),
 }
 
@@ -106,6 +114,19 @@ where
         Ok(ReceivedToken::NewResultset(meta))
     }
 
+    async fn get_alt_metadata(&mut self) -> crate::Result<ReceivedToken> {
+        let meta = Arc::new(TokenAltMetaData::decode(self.conn).await?);
+        self.conn.context_mut().set_alt_meta(meta.clone());
+        event!(Level::TRACE, ?meta);
+        Ok(ReceivedToken::AltMetaData(meta))
+    }
+
+    async fn get_alt_row(&mut self) -> crate::Result<ReceivedToken> {
+        let row = TokenAltRow::decode(self.conn).await?;
+        event!(Level::TRACE, message = ?row);
+        Ok(ReceivedToken::AltRow(row))
+    }
+
     async fn get_row(&mut self) -> crate::Result<ReceivedToken> {
         let return_value = TokenRow::decode(self.conn).await?;
 
@@ -148,6 +169,24 @@ where
         Ok(ReceivedToken::Order(order))
     }
 
+    async fn get_col_info(&mut self) -> crate::Result<ReceivedToken> {
+        let info = TokenColInfo::decode(self.conn).await?;
+        event!(Level::TRACE, message = ?info);
+        Ok(ReceivedToken::ColInfo(info))
+    }
+
+    async fn get_col_name(&mut self) -> crate::Result<ReceivedToken> {
+        let names = TokenColName::decode(self.conn).await?;
+        event!(Level::TRACE, message = ?names);
+        Ok(ReceivedToken::ColName(names))
+    }
+
+    async fn get_tab_name(&mut self) -> crate::Result<ReceivedToken> {
+        let names = TokenTabName::decode(self.conn).await?;
+        event!(Level::TRACE, message = ?names);
+        Ok(ReceivedToken::TabName(names))
+    }
+
     async fn get_done_value(&mut self) -> crate::Result<ReceivedToken> {
         let done = TokenDone::decode(self.conn).await?;
         event!(Level::TRACE, "{}", done);
@@ -169,16 +208,32 @@ where
     async fn get_env_change(&mut self) -> crate::Result<ReceivedToken> {
         let change = TokenEnvChange::decode(self.conn).await?;
 
-        match change {
+        match &change {
             TokenEnvChange::PacketSize(new_size, _) => {
-                self.conn.context_mut().set_packet_size(new_size);
+                self.conn.context_mut().set_packet_size(*new_size);
             }
             TokenEnvChange::BeginTransaction(desc) => {
-                self.conn.context_mut().set_transaction_descriptor(desc);
+                self.conn.context_mut().set_transaction_descriptor(*desc);
             }
-            TokenEnvChange::CommitTransaction
-            | TokenEnvChange::RollbackTransaction
-            | TokenEnvChange::DefectTransaction => {
+            TokenEnvChange::EnlistDtcTransaction(desc) => {
+                self.conn.context_mut().set_transaction_descriptor(*desc);
+            }
+            TokenEnvChange::CommitTransaction { new, .. } => {
+                self.update_transaction_descriptor(new);
+            }
+            TokenEnvChange::RollbackTransaction { new, .. } => {
+                self.update_transaction_descriptor(new);
+            }
+            TokenEnvChange::DefectTransaction { new, .. } => {
+                self.update_transaction_descriptor(new);
+            }
+            TokenEnvChange::PromoteTransaction { dtc, .. } => {
+                self.update_transaction_descriptor(dtc);
+            }
+            TokenEnvChange::TransactionEnded { new, .. } => {
+                self.update_transaction_descriptor(new);
+            }
+            TokenEnvChange::ResetConnection => {
                 self.conn.context_mut().set_transaction_descriptor([0; 8]);
             }
             _ => (),
@@ -189,6 +244,16 @@ where
         Ok(ReceivedToken::EnvChange(change))
     }
 
+    fn update_transaction_descriptor(&mut self, bytes: &[u8]) {
+        if bytes.len() == 8 {
+            let mut desc = [0u8; 8];
+            desc.copy_from_slice(bytes);
+            self.conn.context_mut().set_transaction_descriptor(desc);
+        } else {
+            self.conn.context_mut().set_transaction_descriptor([0; 8]);
+        }
+    }
+
     async fn get_info(&mut self) -> crate::Result<ReceivedToken> {
         let info = TokenInfo::decode(self.conn).await?;
         event!(Level::INFO, "{}", info.message);
@@ -197,6 +262,7 @@ where
 
     async fn get_login_ack(&mut self) -> crate::Result<ReceivedToken> {
         let ack = TokenLoginAck::decode(self.conn).await?;
+        self.conn.context_mut().set_version(ack.tds_version);
         event!(Level::INFO, "{} version {}", ack.prog_name, ack.version);
         Ok(ReceivedToken::LoginAck(ack))
     }
@@ -209,6 +275,18 @@ where
             ack.features.len()
         );
         Ok(ReceivedToken::FeatureExtAck(ack))
+    }
+
+    async fn get_session_state(&mut self) -> crate::Result<ReceivedToken> {
+        let state = TokenSessionState::decode(self.conn).await?;
+        event!(Level::TRACE, message = ?state);
+        Ok(ReceivedToken::SessionState(state))
+    }
+
+    async fn get_fed_auth_info(&mut self) -> crate::Result<ReceivedToken> {
+        let info = TokenFedAuthInfo::decode(self.conn).await?;
+        event!(Level::TRACE, message = ?info);
+        Ok(ReceivedToken::FedAuthInfo(info))
     }
 
     async fn get_sspi(&mut self) -> crate::Result<ReceivedToken> {
@@ -233,21 +311,27 @@ where
 
             let token = match ty {
                 TokenType::ReturnStatus => this.get_return_status().await?,
+                TokenType::AltMetaData => this.get_alt_metadata().await?,
                 TokenType::ColMetaData => this.get_col_metadata().await?,
+                TokenType::ColName => this.get_col_name().await?,
                 TokenType::Row => this.get_row().await?,
                 TokenType::NbcRow => this.get_nbc_row().await?,
+                TokenType::AltRow => this.get_alt_row().await?,
                 TokenType::Done => this.get_done_value().await?,
                 TokenType::DoneProc => this.get_done_proc_value().await?,
                 TokenType::DoneInProc => this.get_done_in_proc_value().await?,
                 TokenType::ReturnValue => this.get_return_value().await?,
                 TokenType::Error => this.get_error().await?,
                 TokenType::Order => this.get_order().await?,
+                TokenType::TabName => this.get_tab_name().await?,
+                TokenType::ColInfo => this.get_col_info().await?,
                 TokenType::EnvChange => this.get_env_change().await?,
+                TokenType::SessionState => this.get_session_state().await?,
                 TokenType::Info => this.get_info().await?,
                 TokenType::LoginAck => this.get_login_ack().await?,
                 TokenType::Sspi => this.get_sspi().await?,
                 TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
-                _ => panic!("Token {:?} unimplemented!", ty),
+                TokenType::FedAuthInfo => this.get_fed_auth_info().await?,
             };
 
             Ok(Some((token, this)))

@@ -1,12 +1,15 @@
 //! TDS wire protocol codec for the server.
 
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 
-use crate::server::messages::{RpcMessage, TdsBackendMessage, TdsFrontendMessage};
+use crate::server::messages::{
+    AllHeaders, RequestFlags, RpcMessage, SqlBatchMessage, TdsBackendMessage,
+    TdsFrontendMessage, TraceActivityHeader, TransactionDescriptorHeader, UnknownHeader,
+};
 use crate::server::state::TdsConnectionState;
 use crate::tds::codec::{
     ColumnData, Decode, Encode, LoginMessage, Packet, PacketCodec, PacketType, PreloginMessage,
-    RpcProcId, RpcStatus, TypeInfo, ALL_HEADERS_LEN_TX,
+    RpcProcId, RpcStatus, TokenSspi, TokenType, TypeInfo,
 };
 use crate::tds::Context;
 use crate::SqlReadBytes;
@@ -15,7 +18,7 @@ use crate::{Error, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use enumflags2::BitFlags;
 use futures_util::io::AsyncRead;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::pin::Pin;
 use std::task::Poll;
 
@@ -27,6 +30,7 @@ pub struct TdsCodec {
     packet_codec: PacketCodec,
     pending_type: Option<PacketType>,
     pending_payload: BytesMut,
+    pending_status: Option<u8>,
 }
 
 impl Default for TdsCodec {
@@ -42,6 +46,7 @@ impl TdsCodec {
             packet_codec: PacketCodec,
             pending_type: None,
             pending_payload: BytesMut::new(),
+            pending_status: None,
         }
     }
 
@@ -57,12 +62,14 @@ impl TdsCodec {
 
         let is_last = packet.is_last();
         let (header, payload) = packet.into_parts();
+        let mut status_bits = header.status_bits();
 
         let payload = match self.pending_type {
             None if is_last => payload,
             None => {
                 self.pending_type = Some(header.r#type());
                 self.pending_payload = payload;
+                self.pending_status = Some(status_bits);
                 return Ok(None);
             }
             Some(pending) => {
@@ -74,6 +81,7 @@ impl TdsCodec {
                     return Ok(None);
                 }
                 self.pending_type = None;
+                status_bits = self.pending_status.take().unwrap_or(status_bits);
                 self.pending_payload.split()
             }
         };
@@ -85,21 +93,29 @@ impl TdsCodec {
                 TdsFrontendMessage::Prelogin(message)
             }
             PacketType::TDSv7Login => {
-                let mut payload = payload;
-                let message = LoginMessage::decode(&mut payload)?;
-                TdsFrontendMessage::Login(message)
+                if let Some(sspi) = decode_sspi_login(&payload)? {
+                    TdsFrontendMessage::Sspi(sspi)
+                } else {
+                    let mut payload = payload;
+                    let message = LoginMessage::decode(&mut payload)?;
+                    TdsFrontendMessage::Login(message)
+                }
             }
             PacketType::SQLBatch => {
                 let mut payload = payload;
-                let batch = decode_sql_batch(&mut payload)?;
+                let batch = decode_sql_batch(&mut payload, status_bits)?;
                 TdsFrontendMessage::SqlBatch(batch)
             }
             PacketType::Rpc => {
-                let message = decode_rpc(payload)?;
+                let message = decode_rpc(payload, status_bits)?;
                 TdsFrontendMessage::Rpc(message)
             }
             PacketType::BulkLoad => TdsFrontendMessage::BulkLoad(payload),
             PacketType::AttentionSignal => TdsFrontendMessage::Attention,
+            PacketType::Sspi => {
+                let token = decode_sspi_payload(payload)?;
+                TdsFrontendMessage::Sspi(token)
+            }
             _ => TdsFrontendMessage::Packet(Packet::new(header, payload)),
         };
 
@@ -117,15 +133,51 @@ impl TdsCodec {
     }
 }
 
-fn decode_sql_batch(payload: &mut BytesMut) -> Result<String> {
+fn decode_sspi_login(payload: &BytesMut) -> Result<Option<TokenSspi>> {
+    if payload.len() < 3 || payload[0] != TokenType::Sspi as u8 {
+        return Ok(None);
+    }
+
+    let len = u16::from_le_bytes([payload[1], payload[2]]) as usize;
+    if payload.len() != 3 + len {
+        return Ok(None);
+    }
+
+    let token = TokenSspi::from_bytes(payload[3..].to_vec());
+    Ok(Some(token))
+}
+
+fn decode_sspi_payload(mut payload: BytesMut) -> Result<TokenSspi> {
+    if payload.is_empty() {
+        return Err(Error::Protocol("sspi: empty payload".into()));
+    }
+
+    if payload[0] == TokenType::Sspi as u8 {
+        payload.advance(1);
+        if payload.len() < 2 {
+            return Err(Error::Protocol("sspi: missing length".into()));
+        }
+        let len = payload.get_u16_le() as usize;
+        if payload.len() < len {
+            return Err(Error::Protocol("sspi: truncated payload".into()));
+        }
+        let bytes = payload.split_to(len).to_vec();
+        Ok(TokenSspi::from_bytes(bytes))
+    } else {
+        Ok(TokenSspi::from_bytes(payload.to_vec()))
+    }
+}
+
+fn decode_sql_batch(payload: &mut BytesMut, status_bits: u8) -> Result<SqlBatchMessage> {
     let mut cursor = Cursor::new(payload);
     if cursor.get_ref().len() < 4 {
         return Err(Error::Protocol("sql batch: missing headers length".into()));
     }
     let headers_len = cursor.read_u32::<LittleEndian>()? as usize;
-    if headers_len > cursor.get_ref().len() {
+    if headers_len < 4 || headers_len > cursor.get_ref().len() {
         return Err(Error::Protocol("sql batch: invalid headers length".into()));
     }
+    let headers = decode_all_headers(&cursor.get_ref()[..headers_len])?;
     cursor.set_position(headers_len as u64);
 
     let remaining = &cursor.get_ref()[headers_len..];
@@ -137,18 +189,24 @@ fn decode_sql_batch(payload: &mut BytesMut) -> Result<String> {
         units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
     }
 
-    String::from_utf16(&units).map_err(|_| Error::Utf16)
+    let batch = String::from_utf16(&units).map_err(|_| Error::Utf16)?;
+    Ok(SqlBatchMessage {
+        batch,
+        headers,
+        request_flags: RequestFlags::from_status_bits(status_bits),
+    })
 }
 
-fn decode_rpc(mut payload: BytesMut) -> Result<RpcMessage> {
+fn decode_rpc(mut payload: BytesMut, status_bits: u8) -> Result<RpcMessage> {
     let mut cursor = Cursor::new(&payload);
     if cursor.get_ref().len() < 4 {
         return Err(Error::Protocol("rpc: missing headers length".into()));
     }
     let headers_len = cursor.read_u32::<LittleEndian>()? as usize;
-    if headers_len < ALL_HEADERS_LEN_TX || headers_len > cursor.get_ref().len() {
+    if headers_len < 4 || headers_len > cursor.get_ref().len() {
         return Err(Error::Protocol("rpc: invalid headers length".into()));
     }
+    let headers = decode_all_headers(&cursor.get_ref()[..headers_len])?;
     cursor.set_position(headers_len as u64);
 
     if (cursor.get_ref().len() as u64) < cursor.position() + 4 {
@@ -184,6 +242,8 @@ fn decode_rpc(mut payload: BytesMut) -> Result<RpcMessage> {
         proc_name,
         flags,
         params,
+        headers,
+        request_flags: RequestFlags::from_status_bits(status_bits),
     })
 }
 
@@ -199,6 +259,83 @@ fn rpc_proc_id_from_u16(id: u16) -> Option<RpcProcId> {
         15 => Some(RpcProcId::Unprepare),
         _ => None,
     }
+}
+
+fn decode_all_headers(bytes: &[u8]) -> Result<AllHeaders> {
+    if bytes.len() < 4 {
+        return Err(Error::Protocol("all headers: missing length".into()));
+    }
+
+    let mut cursor = Cursor::new(bytes);
+    let total_len = cursor.read_u32::<LittleEndian>()? as usize;
+    if total_len < 4 || total_len > bytes.len() {
+        return Err(Error::Protocol("all headers: invalid length".into()));
+    }
+
+    let mut headers = AllHeaders::default();
+    let mut consumed = 4usize;
+
+    while consumed < total_len {
+        if total_len - consumed < 6 {
+            return Err(Error::Protocol("all headers: truncated header".into()));
+        }
+
+        let header_len = cursor.read_u32::<LittleEndian>()? as usize;
+        let header_type = cursor.read_u16::<LittleEndian>()?;
+        if header_len < 6 || consumed + header_len > total_len {
+            return Err(Error::Protocol("all headers: invalid header length".into()));
+        }
+
+        let data_len = header_len - 6;
+        let mut data = vec![0u8; data_len];
+        cursor.read_exact(&mut data)?;
+        consumed += header_len;
+
+        match header_type {
+            1 => {
+                headers.query_descriptor = Some(data);
+            }
+            2 => {
+                if data_len != 12 {
+                    return Err(Error::Protocol(
+                        "all headers: invalid transaction descriptor length".into(),
+                    ));
+                }
+                let mut descriptor = [0u8; 8];
+                descriptor.copy_from_slice(&data[..8]);
+                let outstanding_requests = u32::from_le_bytes([
+                    data[8], data[9], data[10], data[11],
+                ]);
+                headers.transaction_descriptor = Some(TransactionDescriptorHeader {
+                    descriptor,
+                    outstanding_requests,
+                });
+            }
+            3 => {
+                if data_len != 20 {
+                    return Err(Error::Protocol(
+                        "all headers: invalid trace activity length".into(),
+                    ));
+                }
+                let mut activity_id = [0u8; 16];
+                activity_id.copy_from_slice(&data[..16]);
+                let sequence_number =
+                    u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+                headers.trace_activity = Some(TraceActivityHeader {
+                    activity_id,
+                    sequence_number,
+                });
+            }
+            _ => {
+                headers.unknown.push(UnknownHeader {
+                    header_type,
+                    data,
+                });
+            }
+        }
+    }
+
+    Ok(headers)
 }
 
 /// Decoded RPC parameter payload.

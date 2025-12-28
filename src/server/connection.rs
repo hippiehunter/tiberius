@@ -1,6 +1,6 @@
 //! TDS connection abstraction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -8,14 +8,14 @@ use std::task::{Context, Poll};
 
 use bytes::{BufMut, BytesMut};
 use futures_util::sink::Sink;
-use futures_util::stream::Stream;
+use futures_util::stream::{Stream, StreamExt};
 
 use crate::server::backend::{NetStream, NetStreamExt};
 use crate::server::codec::TdsCodec;
 use crate::server::handler::TdsClientInfo;
 use crate::server::messages::{BackendToken, TdsBackendMessage, TdsFrontendMessage};
 use crate::server::state::TdsConnectionState;
-use crate::tds::codec::{Encode, Packet, PacketHeader, PacketStatus, PacketType};
+use crate::tds::codec::{Encode, FeatureLevel, Packet, PacketHeader, PacketStatus, PacketType};
 use std::sync::Arc;
 use crate::tds::Context as TdsContext;
 use crate::Error;
@@ -36,6 +36,10 @@ pub struct TdsConnection<S: NetStream> {
     needs_flush: bool,
     is_secure: bool,
     encryption: EncryptionLevel,
+    pending_messages: VecDeque<TdsFrontendMessage>,
+    attention_pending: bool,
+    reset_connection_pending: bool,
+    message_in_progress: bool,
     socket_addr: SocketAddr,
 }
 
@@ -57,6 +61,10 @@ impl<S: NetStream> TdsConnection<S> {
             needs_flush: false,
             is_secure: false,
             encryption: EncryptionLevel::NotSupported,
+            pending_messages: VecDeque::new(),
+            attention_pending: false,
+            reset_connection_pending: false,
+            message_in_progress: false,
             socket_addr,
         }
     }
@@ -84,6 +92,61 @@ impl<S: NetStream> TdsConnection<S> {
     /// Mark the connection as secure (TLS enabled).
     pub fn set_secure(&mut self, secure: bool) {
         self.is_secure = secure;
+    }
+
+    /// True if an attention/cancel has been observed.
+    pub fn attention_pending(&self) -> bool {
+        self.attention_pending
+    }
+
+    /// Clear the attention/cancel state.
+    pub fn clear_attention(&mut self) {
+        self.attention_pending = false;
+    }
+
+    /// Mark an attention/cancel as pending.
+    pub fn mark_attention(&mut self) {
+        self.attention_pending = true;
+        self.state = TdsConnectionState::AttentionPending;
+    }
+
+    /// Mark a reset connection request as pending.
+    pub fn mark_reset_connection(&mut self, skip_tran: bool) {
+        self.reset_connection_pending = true;
+        if !skip_tran {
+            self.context.set_transaction_descriptor([0; 8]);
+        }
+    }
+
+    /// Poll for attention messages while inside a handler.
+    pub async fn poll_attention(&mut self) -> Result<bool, Error> {
+        if self.attention_pending {
+            return Ok(true);
+        }
+
+        if let Some(pos) = self
+            .pending_messages
+            .iter()
+            .position(|msg| matches!(msg, TdsFrontendMessage::Attention))
+        {
+            self.pending_messages.remove(pos);
+            self.mark_attention();
+            return Ok(true);
+        }
+
+        match self.next().await {
+            Some(Ok(msg)) => {
+                if matches!(msg, TdsFrontendMessage::Attention) {
+                    self.mark_attention();
+                    Ok(true)
+                } else {
+                    self.pending_messages.push_back(msg);
+                    Ok(false)
+                }
+            }
+            Some(Err(err)) => Err(err),
+            None => Ok(false),
+        }
     }
 
     /// Get the negotiated encryption level.
@@ -173,47 +236,74 @@ impl<S: NetStream> TdsConnection<S> {
             TdsBackendMessage::Prelogin(message) => {
                 let mut payload = BytesMut::new();
                 message.encode(&mut payload)?;
-                // FreeTDS expects prelogin replies in a TDS_REPLY packet (0x04).
-                self.write_payload_as_packets(PacketType::TabularResult, payload)?;
+                let packet_type = match self.metadata.get("prelogin_packet_type").map(String::as_str)
+                {
+                    Some("tabular") => PacketType::TabularResult,
+                    _ => PacketType::PreLogin,
+                };
+                self.write_payload_as_packets(packet_type, payload, true)?;
                 Ok(())
             }
             TdsBackendMessage::Token(token) => {
-                self.encode_tokens(std::iter::once(token))?;
+                self.encode_tokens(std::iter::once(token), true)?;
+                Ok(())
+            }
+            TdsBackendMessage::TokenPartial(token) => {
+                self.encode_tokens(std::iter::once(token), false)?;
                 Ok(())
             }
             TdsBackendMessage::Tokens(tokens) => {
-                self.encode_tokens(tokens.into_iter())?;
+                self.encode_tokens(tokens.into_iter(), true)?;
                 Ok(())
             }
             TdsBackendMessage::TokenBytes(payload) => {
-                self.write_payload_as_packets(PacketType::TabularResult, payload)?;
+                self.write_payload_as_packets(PacketType::TabularResult, payload, true)?;
+                Ok(())
+            }
+            TdsBackendMessage::TokenBytesPartial(payload) => {
+                self.write_payload_as_packets(PacketType::TabularResult, payload, false)?;
                 Ok(())
             }
             TdsBackendMessage::Packet(packet) => self.codec.encode(TdsBackendMessage::Packet(packet), &mut self.write_buf),
         }
     }
 
-    fn encode_tokens<I>(&mut self, tokens: I) -> Result<(), Error>
+    fn encode_tokens<I>(&mut self, tokens: I, end_of_message: bool) -> Result<(), Error>
     where
         I: IntoIterator<Item = BackendToken>,
     {
         let mut payload = BytesMut::new();
+        if self.reset_connection_pending {
+            self.reset_connection_pending = false;
+            self.encode_token(
+                BackendToken::EnvChange(crate::tds::codec::TokenEnvChange::ResetConnection),
+                &mut payload,
+            )?;
+        }
         for token in tokens {
             self.encode_token(token, &mut payload)?;
         }
-        self.write_payload_as_packets(PacketType::TabularResult, payload)?;
+        self.write_payload_as_packets(PacketType::TabularResult, payload, end_of_message)?;
         Ok(())
     }
 
     fn encode_token(&mut self, token: BackendToken, payload: &mut BytesMut) -> Result<(), Error> {
+        let done_row_count_bytes = self.context.version().done_row_count_bytes();
         match token {
             BackendToken::LoginAck(token) => token.encode(payload),
             BackendToken::EnvChange(token) => token.encode(payload),
             BackendToken::Info(token) => token.encode(payload),
             BackendToken::Error(token) => token.encode(payload),
             BackendToken::FeatureExtAck(token) => token.encode(payload),
+            BackendToken::ColName(token) => token.encode(payload),
+            BackendToken::TabName(token) => token.encode(payload),
+            BackendToken::ColInfo(token) => token.encode(payload),
             BackendToken::ColMetaData(token) => {
                 self.context.set_last_meta(Arc::new(token.clone()));
+                token.encode(payload)
+            }
+            BackendToken::AltMetaData(token) => {
+                self.context.set_alt_meta(Arc::new(token.clone()));
                 token.encode(payload)
             }
             BackendToken::Row(token) => {
@@ -223,12 +313,41 @@ impl<S: NetStream> TdsConnection<S> {
                     .ok_or_else(|| Error::Protocol("missing column metadata".into()))?;
                 token.encode_with_columns(payload, &meta.columns)
             }
-            BackendToken::Done(token) => token.encode(payload),
+            BackendToken::NbcRow(token) => {
+                let meta = self
+                    .context
+                    .last_meta()
+                    .ok_or_else(|| Error::Protocol("missing column metadata".into()))?;
+                token.encode_nbc_with_columns(payload, &meta.columns)
+            }
+            BackendToken::AltRow(token) => {
+                let meta = self
+                    .context
+                    .alt_meta(token.id)
+                    .ok_or_else(|| Error::Protocol("missing alt metadata".into()))?;
+                token.encode_with_columns(payload, &meta.columns)
+            }
+            BackendToken::Order(token) => token.encode(payload),
+            BackendToken::Done(token) => {
+                token.encode_with_type_and_count_bytes(
+                    payload,
+                    crate::tds::codec::TokenType::Done,
+                    done_row_count_bytes,
+                )
+            }
             BackendToken::DoneProc(token) => {
-                token.encode_with_type(payload, crate::tds::codec::TokenType::DoneProc)
+                token.encode_with_type_and_count_bytes(
+                    payload,
+                    crate::tds::codec::TokenType::DoneProc,
+                    done_row_count_bytes,
+                )
             }
             BackendToken::DoneInProc(token) => {
-                token.encode_with_type(payload, crate::tds::codec::TokenType::DoneInProc)
+                token.encode_with_type_and_count_bytes(
+                    payload,
+                    crate::tds::codec::TokenType::DoneInProc,
+                    done_row_count_bytes,
+                )
             }
             BackendToken::ReturnStatus(status) => {
                 payload.put_u8(crate::tds::codec::TokenType::ReturnStatus as u8);
@@ -236,6 +355,8 @@ impl<S: NetStream> TdsConnection<S> {
                 Ok(())
             }
             BackendToken::ReturnValue(token) => token.encode(payload),
+            BackendToken::SessionState(token) => token.encode(payload),
+            BackendToken::FedAuthInfo(token) => token.encode(payload),
             BackendToken::Sspi(token) => token.encode(payload),
         }
     }
@@ -244,7 +365,11 @@ impl<S: NetStream> TdsConnection<S> {
         &mut self,
         ty: PacketType,
         mut payload: BytesMut,
+        end_of_message: bool,
     ) -> Result<(), Error> {
+        if !self.message_in_progress {
+            self.context.reset_packet_id();
+        }
         let packet_size = (self.context.packet_size() as usize)
             .saturating_sub(crate::tds::codec::HEADER_BYTES);
 
@@ -258,7 +383,7 @@ impl<S: NetStream> TdsConnection<S> {
             let id = self.context.next_packet_id();
             let mut header = PacketHeader::new(0, id);
             header.set_type(ty);
-            if payload.is_empty() {
+            if payload.is_empty() && end_of_message {
                 header.set_status(PacketStatus::EndOfMessage);
             } else {
                 header.set_status(PacketStatus::NormalMessage);
@@ -269,6 +394,7 @@ impl<S: NetStream> TdsConnection<S> {
                 .encode(TdsBackendMessage::Packet(packet), &mut self.write_buf)?;
         }
 
+        self.message_in_progress = !end_of_message;
         self.needs_flush = true;
         Ok(())
     }
@@ -311,6 +437,14 @@ impl<S: NetStream> TdsClientInfo for TdsConnection<S> {
         self.context.set_packet_size(size);
     }
 
+    fn tds_version(&self) -> FeatureLevel {
+        self.context.version()
+    }
+
+    fn set_tds_version(&mut self, version: FeatureLevel) {
+        self.context.set_version(version);
+    }
+
     fn transaction_descriptor(&self) -> [u8; 8] {
         self.context.transaction_descriptor()
     }
@@ -326,6 +460,21 @@ impl<S: NetStream> TdsClientInfo for TdsConnection<S> {
     fn set_encryption(&mut self, encryption: EncryptionLevel) {
         self.encryption = encryption;
     }
+
+    fn attention_pending(&self) -> bool {
+        self.attention_pending
+    }
+
+    fn clear_attention(&mut self) {
+        TdsConnection::clear_attention(self);
+    }
+
+    fn poll_attention<'a>(&'a mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, Error>> + Send + 'a>>
+    where
+        Self: Sized,
+    {
+        Box::pin(async move { TdsConnection::poll_attention(self).await })
+    }
 }
 
 impl<S: NetStream> Stream for TdsConnection<S> {
@@ -333,6 +482,10 @@ impl<S: NetStream> Stream for TdsConnection<S> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+
+        if let Some(msg) = this.pending_messages.pop_front() {
+            return Poll::Ready(Some(Ok(msg)));
+        }
 
         match this.try_decode() {
             Ok(Some(msg)) => return Poll::Ready(Some(Ok(msg))),

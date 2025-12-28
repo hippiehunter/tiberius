@@ -229,8 +229,7 @@
 //! - If using an [ADO.NET connection string], it is possible to create a
 //!   [`Config`] from one. Please see the documentation for
 //!   [`from_ado_string`] for details.
-//! - If wanting to use Tiberius with SQL Server version 2005, one must
-//!   disable the `tds73` feature.
+//! - SQL Server 2005 only supports `datetime` and `smalldatetime` types.
 //!
 //! [`EncryptionLevel`]: enum.EncryptionLevel.html
 //! [`Client`]: struct.Client.html
@@ -268,6 +267,7 @@ mod row;
 mod tds;
 
 mod sql_browser;
+pub mod server;
 
 pub use client::{AuthMethod, Client, Config};
 pub(crate) use error::Error;
@@ -277,10 +277,19 @@ pub use result::*;
 pub use row::{Column, ColumnType, Row};
 pub use sql_browser::SqlBrowser;
 pub use tds::{
-    codec::{BulkLoadRequest, ColumnData, ColumnFlag, IntoRow, TokenRow, TypeLength},
+        codec::{
+        AltMetaDataColumn, BaseMetaDataColumn, BulkLoadRequest, ColumnData, ColumnFlag, Encode,
+        FedAuthInfoOption, FixedLenType, IntoRow, LoginMessage, MetaDataColumn, PreloginMessage,
+        RpcOption, RpcProcId, RpcStatus, DoneStatus, SessionStateEntry, SsVariantInfo,
+        TokenAltMetaData, TokenAltRow, TokenColInfo, TokenColMetaData, TokenColName, TokenDone,
+        TokenEnvChange, TokenError, TokenFedAuthInfo, TokenFeatureExtAck, TokenInfo, TokenLoginAck,
+        TokenOrder, TokenReturnValue, TokenRow, TokenSessionState, TokenSspi, TokenTabName,
+        TypeInfo, TypeLength, TvpColumn, TvpData, TvpInfo, UdtInfo, VarLenContext, VarLenType,
+        VariantData,
+    },
     numeric,
     stream::QueryStream,
-    time, xml, EncryptionLevel,
+    time, xml, Collation, EncryptionLevel,
 };
 pub use to_sql::{IntoSql, ToSql};
 pub use uuid::Uuid;

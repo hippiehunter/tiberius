@@ -64,8 +64,12 @@ pub enum ColumnType {
     Bitn,
     /// A decimal value (same as `Numericn`).
     Decimaln,
+    /// A legacy decimal value.
+    Decimal,
     /// A numeric value (same as `Decimaln`).
     Numericn,
+    /// A legacy numeric value.
+    Numeric,
     /// A n-bit floating point value.
     Floatn,
     /// A n-bit datetime value (TDS 7.2).
@@ -86,6 +90,14 @@ pub enum ColumnType {
     BigBinary,
     /// A string value.
     BigChar,
+    /// A variable binary value with 1-byte length.
+    VarBinary,
+    /// A variable string value with 1-byte length.
+    VarChar,
+    /// A binary value with 1-byte length.
+    Binary,
+    /// A string value with 1-byte length.
+    Char,
     /// A variable string value with UTF-16 encoding.
     NVarchar,
     /// A string value with UTF-16 encoding.
@@ -102,6 +114,8 @@ pub enum ColumnType {
     NText,
     /// An SQL variant type.
     SSVariant,
+    /// A table-valued parameter.
+    Tvp,
 }
 
 impl From<&TypeInfo> for ColumnType {
@@ -132,7 +146,9 @@ impl From<&TypeInfo> for ColumnType {
                 },
                 VarLenType::Bitn => Self::Bitn,
                 VarLenType::Decimaln => Self::Decimaln,
+                VarLenType::Decimal => Self::Decimal,
                 VarLenType::Numericn => Self::Numericn,
+                VarLenType::Numeric => Self::Numeric,
                 VarLenType::Floatn => match cx.len() {
                     4 => Self::Float4,
                     8 => Self::Float8,
@@ -140,18 +156,18 @@ impl From<&TypeInfo> for ColumnType {
                 },
                 VarLenType::Money => Self::Money,
                 VarLenType::Datetimen => Self::Datetimen,
-                #[cfg(feature = "tds73")]
                 VarLenType::Daten => Self::Daten,
-                #[cfg(feature = "tds73")]
                 VarLenType::Timen => Self::Timen,
-                #[cfg(feature = "tds73")]
                 VarLenType::Datetime2 => Self::Datetime2,
-                #[cfg(feature = "tds73")]
                 VarLenType::DatetimeOffsetn => Self::DatetimeOffsetn,
                 VarLenType::BigVarBin => Self::BigVarBin,
                 VarLenType::BigVarChar => Self::BigVarChar,
                 VarLenType::BigBinary => Self::BigBinary,
                 VarLenType::BigChar => Self::BigChar,
+                VarLenType::VarBinary => Self::VarBinary,
+                VarLenType::VarChar => Self::VarChar,
+                VarLenType::Binary => Self::Binary,
+                VarLenType::Char => Self::Char,
                 VarLenType::NVarchar => Self::NVarchar,
                 VarLenType::NChar => Self::NChar,
                 VarLenType::Xml => Self::Xml,
@@ -160,28 +176,31 @@ impl From<&TypeInfo> for ColumnType {
                 VarLenType::Image => Self::Image,
                 VarLenType::NText => Self::NText,
                 VarLenType::SSVariant => Self::SSVariant,
+                VarLenType::Tvp => Self::Tvp,
             },
             TypeInfo::VarLenSizedPrecision { ty, .. } => match ty {
                 VarLenType::Guid => Self::Guid,
                 VarLenType::Intn => Self::Intn,
                 VarLenType::Bitn => Self::Bitn,
                 VarLenType::Decimaln => Self::Decimaln,
+                VarLenType::Decimal => Self::Decimal,
                 VarLenType::Numericn => Self::Numericn,
+                VarLenType::Numeric => Self::Numeric,
                 VarLenType::Floatn => Self::Floatn,
                 VarLenType::Money => Self::Money,
                 VarLenType::Datetimen => Self::Datetimen,
-                #[cfg(feature = "tds73")]
                 VarLenType::Daten => Self::Daten,
-                #[cfg(feature = "tds73")]
                 VarLenType::Timen => Self::Timen,
-                #[cfg(feature = "tds73")]
                 VarLenType::Datetime2 => Self::Datetime2,
-                #[cfg(feature = "tds73")]
                 VarLenType::DatetimeOffsetn => Self::DatetimeOffsetn,
                 VarLenType::BigVarBin => Self::BigVarBin,
                 VarLenType::BigVarChar => Self::BigVarChar,
                 VarLenType::BigBinary => Self::BigBinary,
                 VarLenType::BigChar => Self::BigChar,
+                VarLenType::VarBinary => Self::VarBinary,
+                VarLenType::VarChar => Self::VarChar,
+                VarLenType::Binary => Self::Binary,
+                VarLenType::Char => Self::Char,
                 VarLenType::NVarchar => Self::NVarchar,
                 VarLenType::NChar => Self::NChar,
                 VarLenType::Xml => Self::Xml,
@@ -190,8 +209,12 @@ impl From<&TypeInfo> for ColumnType {
                 VarLenType::Image => Self::Image,
                 VarLenType::NText => Self::NText,
                 VarLenType::SSVariant => Self::SSVariant,
+                VarLenType::Tvp => Self::Tvp,
             },
             TypeInfo::Xml { .. } => Self::Xml,
+            TypeInfo::Udt(_) => Self::Udt,
+            TypeInfo::SsVariant(_) => Self::SSVariant,
+            TypeInfo::Tvp(_) => Self::Tvp,
         }
     }
 }

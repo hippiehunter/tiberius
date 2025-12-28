@@ -23,7 +23,9 @@ pub struct RustlsAcceptor {
 }
 
 impl RustlsAcceptor {
-    pub fn new(config: Arc<async_rustls::rustls::ServerConfig>) -> Self {
+    pub fn new(mut config: Arc<async_rustls::rustls::ServerConfig>) -> Self {
+        // TLS 1.3 tickets are post-handshake messages that don't fit TDS prelogin framing.
+        Arc::make_mut(&mut config).send_tls13_tickets = 0;
         Self {
             inner: AsyncRustlsAcceptor::from(config),
         }
