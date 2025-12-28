@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use futures_util::sink::Sink;
 
 use crate::EncryptionLevel;
-use crate::server::messages::TdsBackendMessage;
+use crate::server::messages::{AllHeaders, TdsBackendMessage};
 use crate::server::state::TdsConnectionState;
 use crate::tds::codec::FeatureLevel;
 use crate::Result;
@@ -28,6 +28,7 @@ pub trait TdsClientInfo {
     fn set_tds_version(&mut self, version: FeatureLevel);
     fn transaction_descriptor(&self) -> [u8; 8];
     fn set_transaction_descriptor(&mut self, desc: [u8; 8]);
+    fn last_request_headers(&self) -> &AllHeaders;
     fn encryption(&self) -> EncryptionLevel;
     fn set_encryption(&mut self, encryption: EncryptionLevel);
     /// True if a cancel/attention has been observed.

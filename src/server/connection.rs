@@ -7,15 +7,19 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::{BufMut, BytesMut};
+use futures_util::future::poll_fn;
 use futures_util::sink::Sink;
-use futures_util::stream::{Stream, StreamExt};
+use futures_util::stream::Stream;
 
 use crate::server::backend::{NetStream, NetStreamExt};
 use crate::server::codec::TdsCodec;
 use crate::server::handler::TdsClientInfo;
-use crate::server::messages::{BackendToken, TdsBackendMessage, TdsFrontendMessage};
+use crate::server::messages::{AllHeaders, BackendToken, TdsBackendMessage, TdsFrontendMessage};
 use crate::server::state::TdsConnectionState;
-use crate::tds::codec::{Encode, FeatureLevel, Packet, PacketHeader, PacketStatus, PacketType};
+use crate::tds::codec::{
+    DoneStatus, Encode, FeatureLevel, Packet, PacketHeader, PacketStatus, PacketType, TokenDone,
+    TokenEnvChange,
+};
 use std::sync::Arc;
 use crate::tds::Context as TdsContext;
 use crate::Error;
@@ -23,6 +27,8 @@ use crate::EncryptionLevel;
 
 /// Buffer size for read/write operations.
 const BUFFER_SIZE: usize = 8192;
+// Packet status bit for attention acknowledgement (server-to-client).
+const STATUS_ATTENTION_ACK: u8 = 0x02;
 
 /// A TDS connection over any NetStream backend.
 pub struct TdsConnection<S: NetStream> {
@@ -38,9 +44,11 @@ pub struct TdsConnection<S: NetStream> {
     encryption: EncryptionLevel,
     pending_messages: VecDeque<TdsFrontendMessage>,
     attention_pending: bool,
+    attention_ack_pending: bool,
     reset_connection_pending: bool,
     message_in_progress: bool,
     socket_addr: SocketAddr,
+    last_request_headers: AllHeaders,
 }
 
 impl<S: NetStream> TdsConnection<S> {
@@ -63,9 +71,11 @@ impl<S: NetStream> TdsConnection<S> {
             encryption: EncryptionLevel::NotSupported,
             pending_messages: VecDeque::new(),
             attention_pending: false,
+            attention_ack_pending: false,
             reset_connection_pending: false,
             message_in_progress: false,
             socket_addr,
+            last_request_headers: AllHeaders::default(),
         }
     }
 
@@ -118,6 +128,10 @@ impl<S: NetStream> TdsConnection<S> {
         }
     }
 
+    pub(crate) fn set_last_request_headers(&mut self, headers: AllHeaders) {
+        self.last_request_headers = headers;
+    }
+
     /// Poll for attention messages while inside a handler.
     pub async fn poll_attention(&mut self) -> Result<bool, Error> {
         if self.attention_pending {
@@ -134,17 +148,37 @@ impl<S: NetStream> TdsConnection<S> {
             return Ok(true);
         }
 
-        match self.next().await {
-            Some(Ok(msg)) => {
-                if matches!(msg, TdsFrontendMessage::Attention) {
-                    self.mark_attention();
-                    Ok(true)
-                } else {
-                    self.pending_messages.push_back(msg);
-                    Ok(false)
+        if let Some(msg) = self.try_decode()? {
+            return if matches!(msg, TdsFrontendMessage::Attention) {
+                self.mark_attention();
+                Ok(true)
+            } else {
+                self.pending_messages.push_back(msg);
+                Ok(false)
+            };
+        }
+
+        let read = poll_fn(|cx| match self.poll_read_buf(cx) {
+            Poll::Ready(res) => Poll::Ready(Some(res)),
+            Poll::Pending => Poll::Ready(None),
+        })
+        .await;
+
+        match read {
+            Some(Ok(0)) => Ok(false),
+            Some(Ok(_)) => match self.try_decode()? {
+                Some(msg) => {
+                    if matches!(msg, TdsFrontendMessage::Attention) {
+                        self.mark_attention();
+                        Ok(true)
+                    } else {
+                        self.pending_messages.push_back(msg);
+                        Ok(false)
+                    }
                 }
-            }
-            Some(Err(err)) => Err(err),
+                None => Ok(false),
+            },
+            Some(Err(err)) => Err(err.into()),
             None => Ok(false),
         }
     }
@@ -287,9 +321,58 @@ impl<S: NetStream> TdsConnection<S> {
         Ok(())
     }
 
+    fn encode_done_token(
+        &mut self,
+        token: TokenDone,
+        ty: crate::tds::codec::TokenType,
+        payload: &mut BytesMut,
+        count_bytes: u8,
+    ) -> Result<(), Error> {
+        let mut token = token;
+        let mut ty = ty;
+
+        if self.attention_pending {
+            token = token.with_added_status(DoneStatus::Attention.into());
+            ty = crate::tds::codec::TokenType::Done;
+        }
+
+        if token.status().contains(DoneStatus::Attention) {
+            self.attention_ack_pending = true;
+            self.clear_attention();
+            self.state = TdsConnectionState::ReadyForQuery;
+        }
+
+        token.encode_with_type_and_count_bytes(payload, ty, count_bytes)
+    }
+
     fn encode_token(&mut self, token: BackendToken, payload: &mut BytesMut) -> Result<(), Error> {
         let done_row_count_bytes = self.context.version().done_row_count_bytes();
         match token {
+            _ if self.attention_pending => match token {
+                BackendToken::EnvChange(token) => match token {
+                    TokenEnvChange::ResetConnection => token.encode(payload),
+                    _ => Ok(()),
+                },
+                BackendToken::Done(token) => self.encode_done_token(
+                    token,
+                    crate::tds::codec::TokenType::Done,
+                    payload,
+                    done_row_count_bytes,
+                ),
+                BackendToken::DoneProc(token) => self.encode_done_token(
+                    token,
+                    crate::tds::codec::TokenType::DoneProc,
+                    payload,
+                    done_row_count_bytes,
+                ),
+                BackendToken::DoneInProc(token) => self.encode_done_token(
+                    token,
+                    crate::tds::codec::TokenType::DoneInProc,
+                    payload,
+                    done_row_count_bytes,
+                ),
+                _ => Ok(()),
+            },
             BackendToken::LoginAck(token) => token.encode(payload),
             BackendToken::EnvChange(token) => token.encode(payload),
             BackendToken::Info(token) => token.encode(payload),
@@ -329,23 +412,26 @@ impl<S: NetStream> TdsConnection<S> {
             }
             BackendToken::Order(token) => token.encode(payload),
             BackendToken::Done(token) => {
-                token.encode_with_type_and_count_bytes(
-                    payload,
+                self.encode_done_token(
+                    token,
                     crate::tds::codec::TokenType::Done,
+                    payload,
                     done_row_count_bytes,
                 )
             }
             BackendToken::DoneProc(token) => {
-                token.encode_with_type_and_count_bytes(
-                    payload,
+                self.encode_done_token(
+                    token,
                     crate::tds::codec::TokenType::DoneProc,
+                    payload,
                     done_row_count_bytes,
                 )
             }
             BackendToken::DoneInProc(token) => {
-                token.encode_with_type_and_count_bytes(
-                    payload,
+                self.encode_done_token(
+                    token,
                     crate::tds::codec::TokenType::DoneInProc,
+                    payload,
                     done_row_count_bytes,
                 )
             }
@@ -385,6 +471,10 @@ impl<S: NetStream> TdsConnection<S> {
             header.set_type(ty);
             if payload.is_empty() && end_of_message {
                 header.set_status(PacketStatus::EndOfMessage);
+                if self.attention_ack_pending {
+                    header.set_status_bits(STATUS_ATTENTION_ACK);
+                    self.attention_ack_pending = false;
+                }
             } else {
                 header.set_status(PacketStatus::NormalMessage);
             }
@@ -451,6 +541,10 @@ impl<S: NetStream> TdsClientInfo for TdsConnection<S> {
 
     fn set_transaction_descriptor(&mut self, desc: [u8; 8]) {
         self.context.set_transaction_descriptor(desc);
+    }
+
+    fn last_request_headers(&self) -> &AllHeaders {
+        &self.last_request_headers
     }
 
     fn encryption(&self) -> EncryptionLevel {

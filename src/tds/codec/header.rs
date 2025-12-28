@@ -110,6 +110,15 @@ impl PacketHeader {
         self.raw_status = status as u8;
     }
 
+    pub fn set_status_bits(&mut self, bits: u8) {
+        self.raw_status |= bits;
+        if (self.raw_status & PacketStatus::EndOfMessage as u8) != 0 {
+            self.status = PacketStatus::EndOfMessage;
+        } else {
+            self.status = PacketStatus::NormalMessage;
+        }
+    }
+
     pub fn set_type(&mut self, ty: PacketType) {
         self.ty = ty;
     }
@@ -128,6 +137,10 @@ impl PacketHeader {
 
     pub fn length(&self) -> u16 {
         self.length
+    }
+
+    pub(crate) fn id(&self) -> u8 {
+        self.id
     }
 }
 

@@ -58,6 +58,15 @@ impl TokenDone {
         self.done_rows
     }
 
+    pub(crate) fn status(&self) -> BitFlags<DoneStatus> {
+        self.status
+    }
+
+    pub(crate) fn with_added_status(mut self, extra: BitFlags<DoneStatus>) -> Self {
+        self.status |= extra;
+        self
+    }
+
     /// Create a DONE token with explicit status flags and a row count.
     pub fn with_status(status: BitFlags<DoneStatus>, rows: u64) -> Self {
         Self {

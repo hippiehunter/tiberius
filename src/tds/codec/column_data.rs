@@ -273,14 +273,14 @@ fn encode_variant_money_bytes(value: f64, len: usize) -> crate::Result<Vec<u8>> 
 }
 
 fn encode_variant_numeric_bytes(value: Numeric) -> crate::Result<Vec<u8>> {
-    let mut buf = BytesMut::new();
-    value.encode(&mut buf)?;
-    if buf.len() < 2 {
-        return Err(crate::Error::Protocol(
-            "sql_variant: numeric payload too short".into(),
-        ));
-    }
-    Ok(buf[1..].to_vec())
+    let raw = value.value();
+    let abs = raw.checked_abs().ok_or_else(|| {
+        crate::Error::BulkInput("sql_variant: numeric overflow".into())
+    })? as u128;
+    let mut buf = BytesMut::with_capacity(17);
+    buf.put_u8(if raw < 0 { 0 } else { 1 });
+    buf.put_u128_le(abs);
+    Ok(buf.to_vec())
 }
 
 fn encode_variant_non_unicode(
@@ -522,7 +522,12 @@ fn encode_variant_payload(ty: TypeInfo, value: ColumnData<'_>) -> crate::Result<
             prop_bytes.put_u8(precision);
             prop_bytes.put_u8(scale);
             value_bytes.extend_from_slice(&encode_variant_numeric_bytes(num)?);
-            ty as u8
+            let base_ty = match ty {
+                VarLenType::Decimaln | VarLenType::Decimal => VarLenType::Decimaln,
+                VarLenType::Numericn | VarLenType::Numeric => VarLenType::Numericn,
+                _ => ty,
+            };
+            base_ty as u8
         }
         (ColumnData::String(Some(value)), TypeInfo::VarLenSized(ctx))
             if matches!(ctx.r#type(), VarLenType::BigChar | VarLenType::BigVarChar) =>
@@ -764,14 +769,30 @@ async fn decode_variant_payload(
             let precision = prop_bytes[0];
             let scale = prop_bytes[1];
             let expected_len = numeric_len_from_precision(precision) as usize;
-            if value_bytes.len() != expected_len {
-                return Err(crate::Error::Protocol(
-                    "sql_variant: numeric length mismatch".into(),
-                ));
-            }
             let mut buf = BytesMut::with_capacity(1 + value_bytes.len());
-            buf.put_u8(expected_len as u8);
-            buf.extend_from_slice(value_bytes);
+            match value_bytes.len() {
+                len if len == expected_len => {
+                    buf.put_u8(expected_len as u8);
+                    buf.extend_from_slice(value_bytes);
+                }
+                len if len == expected_len + 1 => {
+                    if value_bytes[0] != expected_len as u8 {
+                        return Err(crate::Error::Protocol(
+                            "sql_variant: numeric length prefix mismatch".into(),
+                        ));
+                    }
+                    buf.extend_from_slice(value_bytes);
+                }
+                17 => {
+                    buf.put_u8(17);
+                    buf.extend_from_slice(value_bytes);
+                }
+                _ => {
+                    return Err(crate::Error::Protocol(
+                        "sql_variant: numeric length mismatch".into(),
+                    ))
+                }
+            }
             let mut numeric_reader = VariantReader::new(buf);
             let numeric = Numeric::decode(&mut numeric_reader, scale)
                 .await?
@@ -791,7 +812,7 @@ async fn decode_variant_payload(
             };
             Ok((ty, ColumnData::Numeric(Some(numeric))))
         }
-        VarLenType::BigVarChar | VarLenType::BigChar => {
+        VarLenType::BigVarChar | VarLenType::BigChar | VarLenType::VarChar | VarLenType::Char => {
             if prop_bytes.len() != 7 {
                 return Err(crate::Error::Protocol(
                     "sql_variant: invalid char prop bytes".into(),
@@ -801,6 +822,26 @@ async fn decode_variant_payload(
             let info = prop.get_u32_le();
             let sort_id = prop.get_u8();
             let max_len = prop.get_u16_le() as usize;
+            let len_prefix = if matches!(var_ty, VarLenType::BigVarChar | VarLenType::BigChar) {
+                2
+            } else {
+                1
+            };
+            let value_bytes = if value_bytes.len() >= len_prefix {
+                let declared = if len_prefix == 2 {
+                    u16::from_le_bytes([value_bytes[0], value_bytes[1]]) as usize
+                } else {
+                    value_bytes[0] as usize
+                };
+                let remaining = value_bytes.len().saturating_sub(len_prefix);
+                if declared == remaining && declared <= max_len {
+                    &value_bytes[len_prefix..]
+                } else {
+                    value_bytes
+                }
+            } else {
+                value_bytes
+            };
             if value_bytes.len() > max_len {
                 return Err(crate::Error::Protocol(
                     "sql_variant: char length exceeds max".into(),
@@ -825,6 +866,17 @@ async fn decode_variant_payload(
             let info = prop.get_u32_le();
             let sort_id = prop.get_u8();
             let max_len = prop.get_u16_le() as usize;
+            let value_bytes = if value_bytes.len() >= 2 {
+                let declared = u16::from_le_bytes([value_bytes[0], value_bytes[1]]) as usize;
+                let remaining = value_bytes.len().saturating_sub(2);
+                if declared == remaining && declared <= max_len {
+                    &value_bytes[2..]
+                } else {
+                    value_bytes
+                }
+            } else {
+                value_bytes
+            };
             if value_bytes.len() > max_len {
                 return Err(crate::Error::Protocol(
                     "sql_variant: nchar length exceeds max".into(),
@@ -844,7 +896,10 @@ async fn decode_variant_payload(
             let ty = TypeInfo::VarLenSized(VarLenContext::new(var_ty, max_len, Some(collation)));
             Ok((ty, ColumnData::String(Some(s.into()))))
         }
-        VarLenType::BigVarBin | VarLenType::BigBinary => {
+        VarLenType::BigVarBin
+        | VarLenType::BigBinary
+        | VarLenType::VarBinary
+        | VarLenType::Binary => {
             if prop_bytes.len() != 2 {
                 return Err(crate::Error::Protocol(
                     "sql_variant: invalid binary prop bytes".into(),
@@ -852,6 +907,26 @@ async fn decode_variant_payload(
             }
             let mut prop = prop_bytes;
             let max_len = prop.get_u16_le() as usize;
+            let len_prefix = if matches!(var_ty, VarLenType::BigVarBin | VarLenType::BigBinary) {
+                2
+            } else {
+                1
+            };
+            let value_bytes = if value_bytes.len() >= len_prefix {
+                let declared = if len_prefix == 2 {
+                    u16::from_le_bytes([value_bytes[0], value_bytes[1]]) as usize
+                } else {
+                    value_bytes[0] as usize
+                };
+                let remaining = value_bytes.len().saturating_sub(len_prefix);
+                if declared == remaining && declared <= max_len {
+                    &value_bytes[len_prefix..]
+                } else {
+                    value_bytes
+                }
+            } else {
+                value_bytes
+            };
             if value_bytes.len() > max_len {
                 return Err(crate::Error::Protocol(
                     "sql_variant: binary length exceeds max".into(),

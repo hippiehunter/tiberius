@@ -1675,20 +1675,19 @@ mod server {
 
                 if lower.contains("tds_headers") {
                     log_event("sql_batch: tds_headers");
-                    let tx_desc = message
-                        .headers
+                    let headers = client.last_request_headers();
+                    let tx_desc = headers
                         .transaction_descriptor
                         .as_ref()
                         .map(|tx| format!("{:02x?}", tx.descriptor))
                         .unwrap_or_else(|| "<none>".to_string());
-                    let query_len = message
-                        .headers
+                    let query_len = headers
                         .query_descriptor
                         .as_ref()
                         .map(|value| value.len())
                         .unwrap_or(0);
-                    let trace_present = message.headers.trace_activity.is_some();
-                    let unknown = message.headers.unknown.len();
+                    let trace_present = headers.trace_activity.is_some();
+                    let unknown = headers.unknown.len();
                     log_event(&format!(
                         "tds_headers: tx_desc={} query_desc_len={} trace={} unknown={} reset={} skip_tran={}",
                         tx_desc,
@@ -1820,20 +1819,19 @@ mod server {
                 + 'a,
         {
             Box::pin(async move {
-                let tx_desc = message
-                    .headers
+                let headers = client.last_request_headers();
+                let tx_desc = headers
                     .transaction_descriptor
                     .as_ref()
                     .map(|tx| format!("{:02x?}", tx.descriptor))
                     .unwrap_or_else(|| "<none>".to_string());
-                let query_len = message
-                    .headers
+                let query_len = headers
                     .query_descriptor
                     .as_ref()
                     .map(|value| value.len())
                     .unwrap_or(0);
-                let trace_present = message.headers.trace_activity.is_some();
-                let unknown = message.headers.unknown.len();
+                let trace_present = headers.trace_activity.is_some();
+                let unknown = headers.unknown.len();
                 log_event(&format!(
                     "rpc from={} proc_id={:?} proc_name={:?} flags={:?} params_len={} headers={{tx_desc={} query_len={} trace={} unknown={}}} reset={} skip_tran={}",
                     client.socket_addr(),
@@ -1856,6 +1854,7 @@ mod server {
                 let proc_name = message.proc_name.as_deref().unwrap_or("");
                 let mut output_only = proc_name.eq_ignore_ascii_case("tds_rpc_out");
                 let output_first = proc_name.eq_ignore_ascii_case("tds_rpc_out_first");
+                let is_tvp = proc_name.eq_ignore_ascii_case("tds_rpc_tvp");
                 let is_executesql = proc_name.eq_ignore_ascii_case("sp_executesql");
                 let is_prepare = proc_name.eq_ignore_ascii_case("sp_prepare");
                 let is_execute = proc_name.eq_ignore_ascii_case("sp_execute");
@@ -1866,6 +1865,22 @@ mod server {
                 if is_prepare {
                     output_only = true;
                 }
+
+                let tvp_stats = if is_tvp {
+                    let stats = params.iter().find_map(|param| {
+                        if let ColumnData::Tvp(Some(tvp)) = &param.value {
+                            Some((tvp.columns.len() as i32, tvp.rows.len() as i32))
+                        } else {
+                            None
+                        }
+                    });
+                    if stats.is_none() {
+                        log_event("tds_rpc_tvp: no tvp param found");
+                    }
+                    stats
+                } else {
+                    None
+                };
 
                 if is_executesql {
                     if let Some(stmt) = params.first() {
@@ -1983,7 +1998,18 @@ mod server {
                     writer.finish_more_in_proc(params.len() as u64).await?;
                 }
 
-                if is_exec_family {
+                if is_tvp {
+                    let (cols, rows) = tvp_stats.unwrap_or((0, 0));
+                    let columns = vec![
+                        meta_fixed("tvp_cols", FixedLenType::Int4),
+                        meta_fixed("tvp_rows", FixedLenType::Int4),
+                    ];
+                    let mut writer = ResultSetWriter::start(client, columns).await?;
+                    writer
+                        .send_row_iter([ColumnData::I32(Some(cols)), ColumnData::I32(Some(rows))])
+                        .await?;
+                    writer.finish_more_in_proc(1).await?;
+                } else if is_exec_family {
                     let columns = vec![meta_fixed("exec_value", FixedLenType::Int4)];
                     let mut writer = ResultSetWriter::start(client, columns).await?;
                     writer.send_row_iter([ColumnData::I32(Some(123))]).await?;
@@ -2116,11 +2142,29 @@ mod server {
             .ok()
             .as_deref()
             == Some("1");
+        let tls13_only = std::env::var("TDS_DUMMY_TLS13_ONLY")
+            .ok()
+            .as_deref()
+            == Some("1");
+
+        if tls12_only && tls13_only {
+            log_event("TLS config: both TLS12_ONLY and TLS13_ONLY set; using TLS 1.3");
+        }
 
         let certs = load_certs(&cert_path)?;
         let key = load_private_key(&key_path)?;
 
-        let builder = if tls12_only {
+        let builder = if tls13_only {
+            ServerConfig::builder()
+                .with_safe_default_cipher_suites()
+                .with_safe_default_kx_groups()
+                .with_protocol_versions(&[&version::TLS13])
+                .map_err(|err| {
+                    log_event(&format!("TLS config error: {err}"));
+                    err
+                })
+                .ok()?
+        } else if tls12_only {
             ServerConfig::builder()
                 .with_safe_default_cipher_suites()
                 .with_safe_default_kx_groups()

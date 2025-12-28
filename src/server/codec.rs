@@ -31,6 +31,7 @@ pub struct TdsCodec {
     pending_type: Option<PacketType>,
     pending_payload: BytesMut,
     pending_status: Option<u8>,
+    pending_discard: bool,
 }
 
 impl Default for TdsCodec {
@@ -47,6 +48,7 @@ impl TdsCodec {
             pending_type: None,
             pending_payload: BytesMut::new(),
             pending_status: None,
+            pending_discard: false,
         }
     }
 
@@ -64,17 +66,58 @@ impl TdsCodec {
         let (header, payload) = packet.into_parts();
         let mut status_bits = header.status_bits();
 
+        if header.r#type() == PacketType::AttentionSignal {
+            if self.pending_type.is_some() {
+                self.pending_discard = true;
+                self.pending_payload.clear();
+            }
+            return Ok(Some(TdsFrontendMessage::Attention));
+        }
+
+        if self.pending_discard {
+            if let Some(pending) = self.pending_type {
+                let starts_new_message =
+                    header.r#type() != pending || header.id() == 1;
+                if starts_new_message {
+                    self.pending_type = None;
+                    self.pending_payload.clear();
+                    self.pending_status = None;
+                    self.pending_discard = false;
+                } else {
+                    if is_last {
+                        self.pending_type = None;
+                        self.pending_payload.clear();
+                        self.pending_status = None;
+                        self.pending_discard = false;
+                    }
+                    return Ok(None);
+                }
+            } else {
+                self.pending_discard = false;
+            }
+        }
+
         let payload = match self.pending_type {
             None if is_last => payload,
             None => {
                 self.pending_type = Some(header.r#type());
                 self.pending_payload = payload;
                 self.pending_status = Some(status_bits);
+                self.pending_discard = false;
                 return Ok(None);
             }
             Some(pending) => {
                 if pending != header.r#type() {
                     return Err(Error::Protocol("tds: packet type mismatch".into()));
+                }
+                if self.pending_discard {
+                    if is_last {
+                        self.pending_type = None;
+                        self.pending_payload.clear();
+                        self.pending_status = None;
+                        self.pending_discard = false;
+                    }
+                    return Ok(None);
                 }
                 self.pending_payload.extend_from_slice(payload.as_ref());
                 if !is_last {
@@ -435,5 +478,158 @@ impl SqlReadBytes for RpcParamReader {
 
     fn context_mut(&mut self) -> &mut Context {
         &mut self.context
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tds::codec::{BatchRequest, Encode, Packet, PacketHeader, PacketStatus, PacketType};
+    use bytes::BytesMut;
+
+    fn encode_packet(ty: PacketType, status: PacketStatus, id: u8, payload: BytesMut) -> BytesMut {
+        let mut header = PacketHeader::new(0, id);
+        header.set_type(ty);
+        header.set_status(status);
+        let packet = Packet::new(header, payload);
+        let mut buf = BytesMut::new();
+        packet.encode(&mut buf).expect("packet encode");
+        buf
+    }
+
+    #[test]
+    fn attention_interleaved_with_multi_packet_sql_batch_discards_pending() {
+        let mut codec = TdsCodec::new();
+        let mut buf = BytesMut::new();
+
+        let long_query = format!("SELECT {}", "x".repeat(4000));
+        let mut payload = BytesMut::new();
+        BatchRequest::new(long_query, [0; 8])
+            .encode(&mut payload)
+            .expect("batch encode");
+
+        let chunk_size = 64;
+        assert!(
+            payload.len() > chunk_size * 2,
+            "payload too small for multi-packet test"
+        );
+
+        let payload_bytes = payload.freeze();
+        let mut batch_packets = Vec::new();
+        let mut id = 1u8;
+        let mut offset = 0usize;
+        while offset < payload_bytes.len() {
+            let end = std::cmp::min(offset + chunk_size, payload_bytes.len());
+            let chunk = BytesMut::from(&payload_bytes[offset..end]);
+            let status = if end == payload_bytes.len() {
+                PacketStatus::EndOfMessage
+            } else {
+                PacketStatus::NormalMessage
+            };
+            batch_packets.push(encode_packet(PacketType::SQLBatch, status, id, chunk));
+            id = id.wrapping_add(1);
+            offset = end;
+        }
+
+        let attention_packet =
+            encode_packet(PacketType::AttentionSignal, PacketStatus::EndOfMessage, id, BytesMut::new());
+        id = id.wrapping_add(1);
+
+        let mut payload2 = BytesMut::new();
+        BatchRequest::new("SELECT 1", [0; 8])
+            .encode(&mut payload2)
+            .expect("batch encode");
+        let followup_packet =
+            encode_packet(PacketType::SQLBatch, PacketStatus::EndOfMessage, id, payload2);
+
+        buf.extend_from_slice(&batch_packets[0]);
+        assert!(
+            codec
+                .decode(&mut buf, TdsConnectionState::ReadyForQuery)
+                .expect("decode")
+                .is_none()
+        );
+
+        buf.extend_from_slice(&attention_packet);
+        let msg = codec
+            .decode(&mut buf, TdsConnectionState::ReadyForQuery)
+            .expect("decode");
+        assert!(matches!(msg, Some(TdsFrontendMessage::Attention)));
+
+        for packet in batch_packets.iter().skip(1) {
+            buf.extend_from_slice(packet);
+            let msg = codec
+                .decode(&mut buf, TdsConnectionState::ReadyForQuery)
+                .expect("decode");
+            assert!(msg.is_none(), "expected discarded batch packets");
+        }
+
+        buf.extend_from_slice(&followup_packet);
+        let msg = codec
+            .decode(&mut buf, TdsConnectionState::ReadyForQuery)
+            .expect("decode");
+        match msg {
+            Some(TdsFrontendMessage::SqlBatch(batch)) => {
+                assert_eq!(batch.batch, "SELECT 1");
+            }
+            other => panic!("unexpected message after discard: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attention_with_incomplete_batch_allows_new_message() {
+        let mut codec = TdsCodec::new();
+        let mut buf = BytesMut::new();
+
+        let long_query = format!("SELECT {}", "x".repeat(4000));
+        let mut payload = BytesMut::new();
+        BatchRequest::new(long_query, [0; 8])
+            .encode(&mut payload)
+            .expect("batch encode");
+
+        let chunk_size = 64;
+        assert!(
+            payload.len() > chunk_size * 2,
+            "payload too small for multi-packet test"
+        );
+
+        let payload_bytes = payload.freeze();
+        let first_chunk = BytesMut::from(&payload_bytes[..chunk_size]);
+        let first_packet =
+            encode_packet(PacketType::SQLBatch, PacketStatus::NormalMessage, 1, first_chunk);
+
+        buf.extend_from_slice(&first_packet);
+        assert!(
+            codec
+                .decode(&mut buf, TdsConnectionState::ReadyForQuery)
+                .expect("decode")
+                .is_none()
+        );
+
+        let attention_packet =
+            encode_packet(PacketType::AttentionSignal, PacketStatus::EndOfMessage, 2, BytesMut::new());
+        buf.extend_from_slice(&attention_packet);
+        let msg = codec
+            .decode(&mut buf, TdsConnectionState::ReadyForQuery)
+            .expect("decode");
+        assert!(matches!(msg, Some(TdsFrontendMessage::Attention)));
+
+        let mut payload2 = BytesMut::new();
+        BatchRequest::new("SELECT 1", [0; 8])
+            .encode(&mut payload2)
+            .expect("batch encode");
+        let followup_packet =
+            encode_packet(PacketType::SQLBatch, PacketStatus::EndOfMessage, 1, payload2);
+
+        buf.extend_from_slice(&followup_packet);
+        let msg = codec
+            .decode(&mut buf, TdsConnectionState::ReadyForQuery)
+            .expect("decode");
+        match msg {
+            Some(TdsFrontendMessage::SqlBatch(batch)) => {
+                assert_eq!(batch.batch, "SELECT 1");
+            }
+            other => panic!("unexpected message after attention: {other:?}"),
+        }
     }
 }

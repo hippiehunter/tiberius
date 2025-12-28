@@ -121,16 +121,28 @@ where
         (TdsConnectionState::ReadyForQuery, TdsFrontendMessage::SqlBatch(message)) => {
             conn.clear_attention();
             apply_request_headers::<S, T>(conn, &message.headers, message.request_flags);
-            sql_batch_handler.on_sql_batch(conn, message).await
+            let result = sql_batch_handler.on_sql_batch(conn, message).await;
+            if result.is_ok() {
+                finish_attention_if_needed::<S, T>(conn).await?;
+            }
+            result
         }
         (TdsConnectionState::ReadyForQuery, TdsFrontendMessage::Rpc(message)) => {
             conn.clear_attention();
             apply_request_headers::<S, T>(conn, &message.headers, message.request_flags);
-            rpc_handler.on_rpc(conn, message).await
+            let result = rpc_handler.on_rpc(conn, message).await;
+            if result.is_ok() {
+                finish_attention_if_needed::<S, T>(conn).await?;
+            }
+            result
         }
         (TdsConnectionState::BulkLoadInProgress, TdsFrontendMessage::BulkLoad(payload)) => {
             conn.clear_attention();
-            bulk_load_handler.on_bulk_load(conn, payload).await
+            let result = bulk_load_handler.on_bulk_load(conn, payload).await;
+            if result.is_ok() {
+                finish_attention_if_needed::<S, T>(conn).await?;
+            }
+            result
         }
         (_, TdsFrontendMessage::Attention) => {
             conn.mark_attention();
@@ -148,6 +160,21 @@ where
     }
 }
 
+async fn finish_attention_if_needed<S, T>(
+    conn: &mut TdsConnection<ServerStream<S, T>>,
+) -> Result<(), Error>
+where
+    S: NetStream,
+    T: TlsAccept,
+{
+    if conn.attention_pending() {
+        let done = TokenDone::with_status(DoneStatus::Attention.into(), 0);
+        conn.send(TdsBackendMessage::Token(BackendToken::Done(done)))
+            .await?;
+    }
+    Ok(())
+}
+
 fn apply_request_headers<S, T>(
     conn: &mut TdsConnection<ServerStream<S, T>>,
     headers: &AllHeaders,
@@ -157,6 +184,7 @@ where
     S: NetStream,
     T: TlsAccept,
 {
+    conn.set_last_request_headers(headers.clone());
     if let Some(tx) = headers.transaction_descriptor.as_ref() {
         conn.set_transaction_descriptor(tx.descriptor);
     }
