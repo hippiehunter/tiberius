@@ -215,6 +215,10 @@ impl<'a> LoginMessage<'a> {
         self.db_name.as_ref()
     }
 
+    pub fn hostname_ref(&self) -> &str {
+        self.hostname.as_ref()
+    }
+
     pub fn has_feature_ext(&self) -> bool {
         self.option_flags_3.contains(OptionFlag3::ExtensionUsed)
     }

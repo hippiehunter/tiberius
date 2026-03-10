@@ -9,7 +9,7 @@ use crate::server::backend::NetStream;
 use crate::server::connection::TdsConnection;
 use crate::server::handler::{
     AttentionHandler, AuthHandler, BulkLoadHandler, ErrorHandler, RpcHandler, SqlBatchHandler,
-    TdsClientInfo, TdsServerHandlers,
+    TdsConnectionContext, TdsServerHandlers,
 };
 use crate::server::messages::{AllHeaders, BackendToken, TdsBackendMessage, TdsFrontendMessage};
 use crate::server::state::TdsConnectionState;
@@ -46,6 +46,11 @@ where
     let error_handler = handlers.error_handler();
 
     loop {
+        // Check for closed state
+        if conn.state() == TdsConnectionState::Closed {
+            return Ok(());
+        }
+
         if matches!(
             conn.state(),
             TdsConnectionState::AwaitingPrelogin
@@ -106,7 +111,8 @@ where
     BH: BulkLoadHandler,
     AT: AttentionHandler,
 {
-    match (conn.state(), msg) {
+    let current_state = conn.state();
+    match (current_state, msg) {
         (TdsConnectionState::AwaitingPrelogin, TdsFrontendMessage::Prelogin(message)) => {
             auth_handler.on_prelogin(conn, message).await?;
             maybe_upgrade_tls(conn, tls_acceptor).await
@@ -119,20 +125,30 @@ where
             auth_handler.on_sspi(conn, token).await
         }
         (TdsConnectionState::ReadyForQuery, TdsFrontendMessage::SqlBatch(message)) => {
+            conn.set_state(TdsConnectionState::QueryInProgress);
             conn.clear_attention();
             apply_request_headers::<S, T>(conn, &message.headers, message.request_flags);
             let result = sql_batch_handler.on_sql_batch(conn, message).await;
             if result.is_ok() {
                 finish_attention_if_needed::<S, T>(conn).await?;
             }
+            // Return to ReadyForQuery if not in AttentionPending (attention clears itself)
+            if conn.state() == TdsConnectionState::QueryInProgress {
+                conn.set_state(TdsConnectionState::ReadyForQuery);
+            }
             result
         }
         (TdsConnectionState::ReadyForQuery, TdsFrontendMessage::Rpc(message)) => {
+            conn.set_state(TdsConnectionState::QueryInProgress);
             conn.clear_attention();
             apply_request_headers::<S, T>(conn, &message.headers, message.request_flags);
             let result = rpc_handler.on_rpc(conn, message).await;
             if result.is_ok() {
                 finish_attention_if_needed::<S, T>(conn).await?;
+            }
+            // Return to ReadyForQuery if not in AttentionPending
+            if conn.state() == TdsConnectionState::QueryInProgress {
+                conn.set_state(TdsConnectionState::ReadyForQuery);
             }
             result
         }
@@ -144,6 +160,16 @@ where
             }
             result
         }
+        // Reject attention during authentication phases
+        (
+            TdsConnectionState::AwaitingPrelogin
+            | TdsConnectionState::AwaitingLogin
+            | TdsConnectionState::AuthenticationInProgress,
+            TdsFrontendMessage::Attention,
+        ) => Err(Error::Protocol(
+            "attention signal not allowed during authentication".into(),
+        )),
+        // Handle attention in other states
         (_, TdsFrontendMessage::Attention) => {
             conn.mark_attention();
             attention_handler.on_attention(conn).await?;
@@ -152,11 +178,17 @@ where
                 conn.send(TdsBackendMessage::Token(BackendToken::Done(done)))
                     .await?;
                 conn.clear_attention();
-                conn.set_state(TdsConnectionState::ReadyForQuery);
             }
             Ok(())
         }
-        _ => Err(Error::Protocol("unexpected message for state".into())),
+        (_, msg) => Err(Error::Protocol(
+            format!(
+                "unexpected message {} for connection state {}",
+                msg.message_type_name(),
+                current_state
+            )
+            .into(),
+        )),
     }
 }
 

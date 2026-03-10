@@ -2,6 +2,15 @@ use super::codec::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Minimum valid TDS packet size (per MS-TDS specification).
+pub const MIN_PACKET_SIZE: u32 = 512;
+
+/// Maximum valid TDS packet size (per MS-TDS specification for modern clients).
+pub const MAX_PACKET_SIZE: u32 = 32767;
+
+/// Default packet size.
+pub const DEFAULT_PACKET_SIZE: u32 = 4096;
+
 /// Context, that might be required to make sure we understand and are understood by the server
 #[derive(Debug)]
 pub(crate) struct Context {
@@ -57,8 +66,22 @@ impl Context {
         self.packet_size
     }
 
-    pub fn set_packet_size(&mut self, new_size: u32) {
-        self.packet_size = new_size;
+    /// Set the packet size, clamping to valid TDS range.
+    /// Returns the actual size that was set.
+    pub fn set_packet_size(&mut self, new_size: u32) -> u32 {
+        self.packet_size = if new_size < MIN_PACKET_SIZE {
+            MIN_PACKET_SIZE
+        } else if new_size > MAX_PACKET_SIZE {
+            MAX_PACKET_SIZE
+        } else {
+            new_size
+        };
+        self.packet_size
+    }
+
+    /// Validate a packet size is within TDS protocol bounds.
+    pub fn validate_packet_size(size: u32) -> bool {
+        size >= MIN_PACKET_SIZE && size <= MAX_PACKET_SIZE
     }
 
     pub fn transaction_descriptor(&self) -> [u8; 8] {

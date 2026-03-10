@@ -1,6 +1,6 @@
 //! TDS connection abstraction.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -13,8 +13,10 @@ use futures_util::stream::Stream;
 
 use crate::server::backend::{NetStream, NetStreamExt};
 use crate::server::codec::TdsCodec;
-use crate::server::handler::TdsClientInfo;
-use crate::server::messages::{AllHeaders, BackendToken, TdsBackendMessage, TdsFrontendMessage};
+use crate::server::handler::{ConnectionMetadata, TdsConnectionContext};
+use crate::server::messages::{
+    AllHeaders, BackendToken, TdsBackendMessage, TdsFrontendMessage, TransactionDescriptor,
+};
 use crate::server::state::TdsConnectionState;
 use crate::tds::codec::{
     DoneStatus, Encode, FeatureLevel, Packet, PacketHeader, PacketStatus, PacketType, TokenDone,
@@ -27,6 +29,11 @@ use crate::EncryptionLevel;
 
 /// Buffer size for read/write operations.
 const BUFFER_SIZE: usize = 8192;
+
+/// Maximum size for the read buffer to prevent unbounded memory growth.
+/// 16 MB should accommodate any reasonable TDS message plus overhead.
+const MAX_READ_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+
 // Packet status bit for attention acknowledgement (server-to-client).
 const STATUS_ATTENTION_ACK: u8 = 0x02;
 
@@ -34,7 +41,7 @@ const STATUS_ATTENTION_ACK: u8 = 0x02;
 pub struct TdsConnection<S: NetStream> {
     stream: S,
     codec: TdsCodec,
-    metadata: HashMap<String, String>,
+    metadata: ConnectionMetadata,
     state: TdsConnectionState,
     context: TdsContext,
     read_buf: BytesMut,
@@ -43,7 +50,6 @@ pub struct TdsConnection<S: NetStream> {
     is_secure: bool,
     encryption: EncryptionLevel,
     pending_messages: VecDeque<TdsFrontendMessage>,
-    attention_pending: bool,
     attention_ack_pending: bool,
     reset_connection_pending: bool,
     message_in_progress: bool,
@@ -56,12 +62,12 @@ impl<S: NetStream> TdsConnection<S> {
     pub fn new(stream: S) -> Self {
         let socket_addr = stream
             .peer_addr()
-            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+            .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
 
         Self {
             stream,
             codec: TdsCodec::new(),
-            metadata: HashMap::new(),
+            metadata: ConnectionMetadata::default(),
             state: TdsConnectionState::AwaitingPrelogin,
             context: TdsContext::new(),
             read_buf: BytesMut::with_capacity(BUFFER_SIZE),
@@ -70,7 +76,6 @@ impl<S: NetStream> TdsConnection<S> {
             is_secure: false,
             encryption: EncryptionLevel::NotSupported,
             pending_messages: VecDeque::new(),
-            attention_pending: false,
             attention_ack_pending: false,
             reset_connection_pending: false,
             message_in_progress: false,
@@ -104,19 +109,21 @@ impl<S: NetStream> TdsConnection<S> {
         self.is_secure = secure;
     }
 
-    /// True if an attention/cancel has been observed.
+    /// True if an attention/cancel has been observed and not yet acknowledged.
     pub fn attention_pending(&self) -> bool {
-        self.attention_pending
+        self.state == TdsConnectionState::AttentionPending
     }
 
-    /// Clear the attention/cancel state.
+    /// Clear the attention/cancel state, transitioning to ReadyForQuery.
+    /// Only changes state if currently in AttentionPending.
     pub fn clear_attention(&mut self) {
-        self.attention_pending = false;
+        if self.state == TdsConnectionState::AttentionPending {
+            self.state = TdsConnectionState::ReadyForQuery;
+        }
     }
 
-    /// Mark an attention/cancel as pending.
+    /// Mark an attention/cancel as pending by transitioning to AttentionPending state.
     pub fn mark_attention(&mut self) {
-        self.attention_pending = true;
         self.state = TdsConnectionState::AttentionPending;
     }
 
@@ -134,7 +141,7 @@ impl<S: NetStream> TdsConnection<S> {
 
     /// Poll for attention messages while inside a handler.
     pub async fn poll_attention(&mut self) -> Result<bool, Error> {
-        if self.attention_pending {
+        if self.attention_pending() {
             return Ok(true);
         }
 
@@ -211,8 +218,23 @@ impl<S: NetStream> TdsConnection<S> {
 
     /// Try to read more data into the buffer.
     fn poll_read_buf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        // Check if buffer would exceed maximum size
+        if self.read_buf.len() >= MAX_READ_BUFFER_SIZE {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "read buffer exceeded maximum size",
+            )));
+        }
+
         if self.read_buf.capacity() - self.read_buf.len() < 1024 {
-            self.read_buf.reserve(BUFFER_SIZE);
+            // Only reserve up to the maximum
+            let reserve_amount = std::cmp::min(
+                BUFFER_SIZE,
+                MAX_READ_BUFFER_SIZE.saturating_sub(self.read_buf.len()),
+            );
+            if reserve_amount > 0 {
+                self.read_buf.reserve(reserve_amount);
+            }
         }
 
         let mut tmp = [0u8; BUFFER_SIZE];
@@ -270,7 +292,7 @@ impl<S: NetStream> TdsConnection<S> {
             TdsBackendMessage::Prelogin(message) => {
                 let mut payload = BytesMut::new();
                 message.encode(&mut payload)?;
-                let packet_type = match self.metadata.get("prelogin_packet_type").map(String::as_str)
+                let packet_type = match self.metadata.custom.get("prelogin_packet_type").map(String::as_str)
                 {
                     Some("tabular") => PacketType::TabularResult,
                     _ => PacketType::PreLogin,
@@ -331,15 +353,15 @@ impl<S: NetStream> TdsConnection<S> {
         let mut token = token;
         let mut ty = ty;
 
-        if self.attention_pending {
+        if self.attention_pending() {
             token = token.with_added_status(DoneStatus::Attention.into());
             ty = crate::tds::codec::TokenType::Done;
         }
 
         if token.status().contains(DoneStatus::Attention) {
             self.attention_ack_pending = true;
+            // clear_attention() handles state transition to ReadyForQuery
             self.clear_attention();
-            self.state = TdsConnectionState::ReadyForQuery;
         }
 
         token.encode_with_type_and_count_bytes(payload, ty, count_bytes)
@@ -348,7 +370,7 @@ impl<S: NetStream> TdsConnection<S> {
     fn encode_token(&mut self, token: BackendToken, payload: &mut BytesMut) -> Result<(), Error> {
         let done_row_count_bytes = self.context.version().done_row_count_bytes();
         match token {
-            _ if self.attention_pending => match token {
+            _ if self.attention_pending() => match token {
                 BackendToken::EnvChange(token) => match token {
                     TokenEnvChange::ResetConnection => token.encode(payload),
                     _ => Ok(()),
@@ -490,7 +512,7 @@ impl<S: NetStream> TdsConnection<S> {
     }
 }
 
-impl<S: NetStream> TdsClientInfo for TdsConnection<S> {
+impl<S: NetStream> TdsConnectionContext for TdsConnection<S> {
     fn socket_addr(&self) -> SocketAddr {
         self.socket_addr
     }
@@ -507,11 +529,11 @@ impl<S: NetStream> TdsClientInfo for TdsConnection<S> {
         self.state = state;
     }
 
-    fn metadata(&self) -> &HashMap<String, String> {
+    fn connection_metadata(&self) -> &ConnectionMetadata {
         &self.metadata
     }
 
-    fn metadata_mut(&mut self) -> &mut HashMap<String, String> {
+    fn connection_metadata_mut(&mut self) -> &mut ConnectionMetadata {
         &mut self.metadata
     }
 
@@ -535,12 +557,12 @@ impl<S: NetStream> TdsClientInfo for TdsConnection<S> {
         self.context.set_version(version);
     }
 
-    fn transaction_descriptor(&self) -> [u8; 8] {
-        self.context.transaction_descriptor()
+    fn transaction_descriptor(&self) -> TransactionDescriptor {
+        TransactionDescriptor::new(self.context.transaction_descriptor())
     }
 
-    fn set_transaction_descriptor(&mut self, desc: [u8; 8]) {
-        self.context.set_transaction_descriptor(desc);
+    fn set_transaction_descriptor(&mut self, desc: TransactionDescriptor) {
+        self.context.set_transaction_descriptor(desc.into_bytes());
     }
 
     fn last_request_headers(&self) -> &AllHeaders {
@@ -556,7 +578,7 @@ impl<S: NetStream> TdsClientInfo for TdsConnection<S> {
     }
 
     fn attention_pending(&self) -> bool {
-        self.attention_pending
+        self.attention_pending()
     }
 
     fn clear_attention(&mut self) {

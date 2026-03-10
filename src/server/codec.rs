@@ -2,9 +2,14 @@
 
 use bytes::{Buf, BytesMut};
 
+/// Maximum size for the pending payload buffer during multi-packet message assembly.
+/// 16 MB should accommodate any reasonable TDS message.
+const MAX_PENDING_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
+
 use crate::server::messages::{
     AllHeaders, RequestFlags, RpcMessage, SqlBatchMessage, TdsBackendMessage,
-    TdsFrontendMessage, TraceActivityHeader, TransactionDescriptorHeader, UnknownHeader,
+    TdsFrontendMessage, TraceActivityHeader, TransactionDescriptor, TransactionDescriptorHeader,
+    UnknownHeader,
 };
 use crate::server::state::TdsConnectionState;
 use crate::tds::codec::{
@@ -100,6 +105,12 @@ impl TdsCodec {
         let payload = match self.pending_type {
             None if is_last => payload,
             None => {
+                // Check initial payload size
+                if payload.len() > MAX_PENDING_PAYLOAD_SIZE {
+                    return Err(Error::Protocol(
+                        "tds: payload exceeded maximum size".into(),
+                    ));
+                }
                 self.pending_type = Some(header.r#type());
                 self.pending_payload = payload;
                 self.pending_status = Some(status_bits);
@@ -119,6 +130,19 @@ impl TdsCodec {
                     }
                     return Ok(None);
                 }
+
+                // Check if extending would exceed maximum size
+                let new_size = self.pending_payload.len().saturating_add(payload.len());
+                if new_size > MAX_PENDING_PAYLOAD_SIZE {
+                    // Clear state and reject
+                    self.pending_type = None;
+                    self.pending_payload.clear();
+                    self.pending_status = None;
+                    return Err(Error::Protocol(
+                        "tds: pending payload exceeded maximum size".into(),
+                    ));
+                }
+
                 self.pending_payload.extend_from_slice(payload.as_ref());
                 if !is_last {
                     return Ok(None);
@@ -344,13 +368,13 @@ fn decode_all_headers(bytes: &[u8]) -> Result<AllHeaders> {
                         "all headers: invalid transaction descriptor length".into(),
                     ));
                 }
-                let mut descriptor = [0u8; 8];
-                descriptor.copy_from_slice(&data[..8]);
+                let mut desc_bytes = [0u8; 8];
+                desc_bytes.copy_from_slice(&data[..8]);
                 let outstanding_requests = u32::from_le_bytes([
                     data[8], data[9], data[10], data[11],
                 ]);
                 headers.transaction_descriptor = Some(TransactionDescriptorHeader {
-                    descriptor,
+                    descriptor: TransactionDescriptor::new(desc_bytes),
                     outstanding_requests,
                 });
             }
@@ -388,6 +412,144 @@ pub struct DecodedRpcParam {
     pub flags: BitFlags<RpcStatus>,
     pub ty: TypeInfo,
     pub value: ColumnData<'static>,
+}
+
+impl DecodedRpcParam {
+    /// Returns `true` if this parameter is an output parameter (ByRefValue flag is set).
+    ///
+    /// Output parameters are passed by reference and can be modified by the server
+    /// to return values back to the client.
+    pub fn is_output(&self) -> bool {
+        self.flags.contains(RpcStatus::ByRefValue)
+    }
+
+    /// Returns `true` if this parameter uses a default value (DefaultValue flag is set).
+    ///
+    /// When this flag is set, the parameter value should be ignored and the server
+    /// should use the default value defined for the parameter.
+    pub fn is_default(&self) -> bool {
+        self.flags.contains(RpcStatus::DefaultValue)
+    }
+
+    /// Returns `true` if this parameter is encrypted (Encrypted flag is set).
+    ///
+    /// Encrypted parameters use Always Encrypted or similar encryption features.
+    pub fn is_encrypted(&self) -> bool {
+        self.flags.contains(RpcStatus::Encrypted)
+    }
+}
+
+/// A collection of decoded RPC parameters with convenient access methods.
+///
+/// This struct wraps a vector of [`DecodedRpcParam`] and provides methods for
+/// accessing parameters by index, name, or filtering by input/output status.
+///
+/// # Example
+///
+/// ```ignore
+/// use tiberius::server::RpcParamSet;
+///
+/// let params: RpcParamSet = rpc_message.into_param_set().await?;
+///
+/// // Access by index (bounds-checked)
+/// let first = params.get(0);
+///
+/// // Access by name (case-insensitive, @ prefix optional)
+/// let named = params.by_name("@id");
+///
+/// // Iterate over output parameters
+/// for param in params.outputs() {
+///     println!("Output: {}", param.name);
+/// }
+/// ```
+///
+/// # Panics
+///
+/// Direct indexing with `params[n]` will panic if `n >= params.len()`.
+/// Use [`get()`](Self::get) for bounds-checked access that returns `Option`.
+#[derive(Debug)]
+pub struct RpcParamSet {
+    params: Vec<DecodedRpcParam>,
+}
+
+impl RpcParamSet {
+    /// Create a new `RpcParamSet` from a vector of decoded parameters.
+    pub fn new(params: Vec<DecodedRpcParam>) -> Self {
+        Self { params }
+    }
+
+    /// Returns a reference to all parameters.
+    pub fn all(&self) -> &[DecodedRpcParam] {
+        &self.params
+    }
+
+    /// Returns a reference to the parameter at the given index, or `None` if out of bounds.
+    pub fn get(&self, index: usize) -> Option<&DecodedRpcParam> {
+        self.params.get(index)
+    }
+
+    /// Returns a reference to the first parameter with the given name, or `None` if not found.
+    ///
+    /// Parameter names are compared case-insensitively and the leading '@' is optional.
+    /// For example, `by_name("@id")` and `by_name("id")` will both match a parameter named "@id".
+    pub fn by_name(&self, name: &str) -> Option<&DecodedRpcParam> {
+        let name_normalized = name.strip_prefix('@').unwrap_or(name);
+        self.params.iter().find(|p| {
+            let param_name = p.name.strip_prefix('@').unwrap_or(&p.name);
+            param_name.eq_ignore_ascii_case(name_normalized)
+        })
+    }
+
+    /// Returns an iterator over output parameters (those with ByRefValue flag set).
+    pub fn outputs(&self) -> impl Iterator<Item = &DecodedRpcParam> {
+        self.params.iter().filter(|p| p.is_output())
+    }
+
+    /// Returns an iterator over input parameters (those without ByRefValue flag set).
+    pub fn inputs(&self) -> impl Iterator<Item = &DecodedRpcParam> {
+        self.params.iter().filter(|p| !p.is_output())
+    }
+
+    /// Returns the number of parameters.
+    pub fn len(&self) -> usize {
+        self.params.len()
+    }
+
+    /// Returns `true` if there are no parameters.
+    pub fn is_empty(&self) -> bool {
+        self.params.is_empty()
+    }
+
+    /// Consumes the set and returns the underlying vector.
+    pub fn into_inner(self) -> Vec<DecodedRpcParam> {
+        self.params
+    }
+}
+
+impl std::ops::Index<usize> for RpcParamSet {
+    type Output = DecodedRpcParam;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.params[index]
+    }
+}
+
+impl IntoIterator for RpcParamSet {
+    type Item = DecodedRpcParam;
+    type IntoIter = std::vec::IntoIter<DecodedRpcParam>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.params.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a RpcParamSet {
+    type Item = &'a DecodedRpcParam;
+    type IntoIter = std::slice::Iter<'a, DecodedRpcParam>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.params.iter()
+    }
 }
 
 /// Decode RPC parameters from a raw RPC payload.

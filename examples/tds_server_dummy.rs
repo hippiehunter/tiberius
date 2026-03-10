@@ -29,7 +29,7 @@ mod server {
         process_connection, AttentionHandler, AuthBuilder, AuthError, AuthHandler, AuthSuccess,
         BulkLoadHandler, DefaultEnvChangeProvider, EnvChangeProvider, ErrorHandler, FedAuthValidator,
         LoginInfo, ResultSetWriter, RpcHandler, SqlAuthSource, SqlBatchHandler, SspiAcceptor,
-        SspiStart, SspiStep, TdsAuthHandler, TdsBackendMessage, TdsClientInfo, TdsConnectionState,
+        SspiStart, SspiStep, TdsAuthHandler, TdsBackendMessage, TdsConnectionContext, TdsConnectionState,
         TdsServerHandlers,
     };
     use tiberius::{
@@ -493,7 +493,7 @@ mod server {
 
         fn env_changes<C>(&self, client: &C, login: &LoginMessage<'_>) -> Vec<TokenEnvChange>
         where
-            C: TdsClientInfo,
+            C: TdsConnectionContext,
         {
             self.inner.env_changes(client, login)
         }
@@ -517,7 +517,7 @@ mod server {
             login: &LoginMessage<'_>,
         ) -> Option<TokenFedAuthInfo>
         where
-            C: TdsClientInfo,
+            C: TdsConnectionContext,
         {
             let force_fedauth =
                 std::env::var("TDS_DUMMY_FORCE_FEDAUTH").ok().as_deref() == Some("1");
@@ -660,7 +660,7 @@ mod server {
             message: PreloginMessage,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>
         where
-            C: TdsClientInfo
+            C: TdsConnectionContext
                 + futures_util::sink::Sink<TdsBackendMessage, Error = tiberius::error::Error>
                 + Unpin
                 + Send
@@ -685,7 +685,7 @@ mod server {
             message: LoginMessage<'static>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>
         where
-            C: TdsClientInfo
+            C: TdsConnectionContext
                 + futures_util::sink::Sink<TdsBackendMessage, Error = tiberius::error::Error>
                 + Unpin
                 + Send
@@ -720,7 +720,7 @@ mod server {
             token: tiberius::TokenSspi,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>
         where
-            C: TdsClientInfo
+            C: TdsConnectionContext
                 + futures_util::sink::Sink<TdsBackendMessage, Error = tiberius::error::Error>
                 + Unpin
                 + Send
@@ -746,7 +746,7 @@ mod server {
             message: tiberius::server::SqlBatchMessage,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>
         where
-            C: TdsClientInfo
+            C: TdsConnectionContext
                 + futures_util::sink::Sink<TdsBackendMessage, Error = tiberius::error::Error>
                 + Unpin
                 + Send
@@ -1812,7 +1812,7 @@ mod server {
             message: tiberius::server::RpcMessage,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>
         where
-            C: TdsClientInfo
+            C: TdsConnectionContext
                 + futures_util::sink::Sink<TdsBackendMessage, Error = tiberius::error::Error>
                 + Unpin
                 + Send
@@ -2052,7 +2052,7 @@ mod server {
             _payload: bytes::BytesMut,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>
         where
-            C: TdsClientInfo
+            C: TdsConnectionContext
                 + futures_util::sink::Sink<TdsBackendMessage, Error = tiberius::error::Error>
                 + Unpin
                 + Send
@@ -2076,7 +2076,7 @@ mod server {
             client: &'a mut C,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>
         where
-            C: TdsClientInfo
+            C: TdsConnectionContext
                 + futures_util::sink::Sink<TdsBackendMessage, Error = tiberius::error::Error>
                 + Unpin
                 + Send
@@ -2099,7 +2099,7 @@ mod server {
     struct DummyErrorHandler;
 
     impl ErrorHandler for DummyErrorHandler {
-        fn on_error(&self, _client: &dyn TdsClientInfo, error: &mut tiberius::error::Error) {
+        fn on_error(&self, _client: &dyn TdsConnectionContext, error: &mut tiberius::error::Error) {
             eprintln!("tds dummy server error: {error}");
         }
     }
