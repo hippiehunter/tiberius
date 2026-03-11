@@ -1,4 +1,9 @@
-use crate::{tds::Numeric, xml::XmlData, ColumnData};
+use crate::{
+    tds::codec::{TvpData, VariantData},
+    tds::Numeric,
+    xml::XmlData,
+    ColumnData,
+};
 use uuid::Uuid;
 
 /// A conversion trait from a TDS type by-reference.
@@ -22,6 +27,8 @@ use uuid::Uuid;
 /// |[`Numeric`]|`numeric`/`decimal`|
 /// |[`Decimal`] (with feature flag `rust_decimal`)|`numeric`/`decimal`|
 /// |[`XmlData`]|`xml`|
+/// |[`VariantData`]|`sql_variant`|
+/// |[`TvpData`]|table-valued parameter|
 /// |[`NaiveDateTime`] (with feature flag `chrono`)|`datetime`/`datetime2`/`smalldatetime`|
 /// |[`NaiveDate`] (with feature flag `chrono`)|`date`|
 /// |[`NaiveTime`] (with feature flag `chrono`)|`time`|
@@ -128,6 +135,54 @@ impl<'a> FromSql<'a> for &'a [u8] {
             ColumnData::Binary(b) => Ok(b.as_ref().map(|s| s.as_ref())),
             v => Err(crate::Error::Conversion(
                 format!("cannot interpret {:?} as a &[u8] value", v).into(),
+            )),
+        }
+    }
+}
+
+// -- VariantData: FromSql / FromSqlOwned --
+
+impl FromSqlOwned for VariantData<'static> {
+    fn from_sql_owned(value: ColumnData<'static>) -> crate::Result<Option<Self>> {
+        match value {
+            ColumnData::Variant(data) => Ok(data),
+            v => Err(crate::Error::Conversion(
+                format!("cannot interpret {:?} as a sql_variant value", v).into(),
+            )),
+        }
+    }
+}
+
+impl<'a> FromSql<'a> for &'a VariantData<'static> {
+    fn from_sql(value: &'a ColumnData<'static>) -> crate::Result<Option<Self>> {
+        match value {
+            ColumnData::Variant(data) => Ok(data.as_ref()),
+            v => Err(crate::Error::Conversion(
+                format!("cannot interpret {:?} as a sql_variant value", v).into(),
+            )),
+        }
+    }
+}
+
+// -- TvpData: FromSql / FromSqlOwned --
+
+impl FromSqlOwned for TvpData<'static> {
+    fn from_sql_owned(value: ColumnData<'static>) -> crate::Result<Option<Self>> {
+        match value {
+            ColumnData::Tvp(data) => Ok(data),
+            v => Err(crate::Error::Conversion(
+                format!("cannot interpret {:?} as a table-valued parameter", v).into(),
+            )),
+        }
+    }
+}
+
+impl<'a> FromSql<'a> for &'a TvpData<'static> {
+    fn from_sql(value: &'a ColumnData<'static>) -> crate::Result<Option<Self>> {
+        match value {
+            ColumnData::Tvp(data) => Ok(data.as_ref()),
+            v => Err(crate::Error::Conversion(
+                format!("cannot interpret {:?} as a table-valued parameter", v).into(),
             )),
         }
     }

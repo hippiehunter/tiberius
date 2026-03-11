@@ -1154,10 +1154,10 @@ mod server {
                             ColumnData::String(Some("beta".into())),
                         ],
                     ];
-                    let tvp = TvpData {
-                        columns: tvp_columns,
-                        rows: tvp_rows,
-                    };
+                    let tvp = TvpData::new("demo_tvp")
+                        .schema("dbo")
+                        .columns(tvp_columns)
+                        .rows(tvp_rows);
                     let columns = vec![meta_type(
                         "tvp_col",
                         TypeInfo::Tvp(TvpInfo {

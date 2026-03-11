@@ -210,6 +210,9 @@ fn column_data_into_static(value: ColumnData<'_>) -> ColumnData<'static> {
 /// Convert TvpData to a 'static version.
 fn tvp_data_into_static(tvp: crate::tds::codec::TvpData<'_>) -> crate::tds::codec::TvpData<'static> {
     crate::tds::codec::TvpData {
+        db_name: Cow::Owned(tvp.db_name.into_owned()),
+        schema: Cow::Owned(tvp.schema.into_owned()),
+        type_name: Cow::Owned(tvp.type_name.into_owned()),
         columns: tvp
             .columns
             .into_iter()

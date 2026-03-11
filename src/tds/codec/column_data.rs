@@ -100,10 +100,81 @@ pub struct TvpColumn<'a> {
 }
 
 /// Table-valued parameter payload (metadata + rows).
+///
+/// When used as an RPC parameter (via [`ToSql`]/[`IntoSql`]), the `type_name`
+/// field must be set to the name of the table type on the server (e.g.
+/// `"dbo.MyTableType"`). The `schema` and `db_name` fields are optional.
+///
+/// # Example
+///
+/// ```
+/// use tiberius::{TvpData, TvpColumn, ColumnData, ColumnFlag, TypeInfo, VarLenContext, VarLenType};
+/// use enumflags2::BitFlags;
+/// use std::borrow::Cow;
+///
+/// let tvp = TvpData::new("MyTableType")
+///     .schema("dbo")
+///     .columns(vec![
+///         TvpColumn {
+///             name: Cow::Borrowed("id"),
+///             user_type: 0,
+///             flags: BitFlags::from(ColumnFlag::Nullable),
+///             ty: TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
+///         },
+///     ])
+///     .rows(vec![
+///         vec![ColumnData::I32(Some(1))],
+///     ]);
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct TvpData<'a> {
+    /// The database name (typically empty for RPC parameters).
+    pub db_name: Cow<'a, str>,
+    /// The schema name (e.g. `"dbo"`).
+    pub schema: Cow<'a, str>,
+    /// The server-side table type name (e.g. `"MyTableType"`).
+    pub type_name: Cow<'a, str>,
+    /// Column definitions.
     pub columns: Vec<TvpColumn<'a>>,
+    /// Row data.
     pub rows: Vec<Vec<ColumnData<'a>>>,
+}
+
+impl<'a> TvpData<'a> {
+    /// Create a new TVP with the given type name (required for RPC parameters).
+    pub fn new(type_name: impl Into<Cow<'a, str>>) -> Self {
+        Self {
+            db_name: Cow::Borrowed(""),
+            schema: Cow::Borrowed(""),
+            type_name: type_name.into(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+        }
+    }
+
+    /// Set the schema name.
+    pub fn schema(mut self, schema: impl Into<Cow<'a, str>>) -> Self {
+        self.schema = schema.into();
+        self
+    }
+
+    /// Set the database name.
+    pub fn db_name(mut self, db_name: impl Into<Cow<'a, str>>) -> Self {
+        self.db_name = db_name.into();
+        self
+    }
+
+    /// Set the column definitions.
+    pub fn columns(mut self, columns: Vec<TvpColumn<'a>>) -> Self {
+        self.columns = columns;
+        self
+    }
+
+    /// Set the row data.
+    pub fn rows(mut self, rows: Vec<Vec<ColumnData<'a>>>) -> Self {
+        self.rows = rows;
+        self
+    }
 }
 
 impl<'a> VariantData<'a> {
@@ -1094,7 +1165,17 @@ impl<'a> ColumnData<'a> {
             ColumnData::DateTimeOffset(_) => "datetimeoffset".into(),
             ColumnData::Udt(_) => "udt".into(),
             ColumnData::Variant(_) => "sql_variant".into(),
-            ColumnData::Tvp(_) => "tvp".into(),
+            ColumnData::Tvp(Some(ref tvp)) => {
+                let mut name = String::new();
+                if !tvp.schema.is_empty() {
+                    name.push_str(tvp.schema.as_ref());
+                    name.push('.');
+                }
+                name.push_str(tvp.type_name.as_ref());
+                name.push_str(" READONLY");
+                name.into()
+            }
+            ColumnData::Tvp(None) => "tvp READONLY".into(),
         }
     }
 
@@ -1808,6 +1889,44 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
             (ColumnData::Tvp(opt), Some(TypeInfo::Tvp(_))) => {
                 encode_tvp_value(dst, opt)?;
             }
+            (ColumnData::Variant(Some(payload)), None) => {
+                // Self-describe sql_variant type info for RPC parameters
+                dst.put_u8(VarLenType::SSVariant as u8);
+                dst.put_u32_le(8016); // standard max_len
+                let len = payload.payload().len();
+                if len == 0 {
+                    return Err(crate::Error::BulkInput(
+                        "sql_variant payload must include type info".into(),
+                    ));
+                }
+                dst.put_u32_le(len as u32);
+                dst.extend_from_slice(payload.payload());
+            }
+            (ColumnData::Variant(None), None) => {
+                dst.put_u8(VarLenType::SSVariant as u8);
+                dst.put_u32_le(8016);
+                dst.put_u32_le(0); // null
+            }
+            (ColumnData::Tvp(Some(mut tvp)), None) => {
+                // Self-describe TVP type info for RPC parameters
+                dst.put_u8(VarLenType::Tvp as u8);
+                crate::tds::codec::token::write_b_varchar(dst, tvp.db_name.as_ref())?;
+                crate::tds::codec::token::write_b_varchar(dst, tvp.schema.as_ref())?;
+                crate::tds::codec::token::write_b_varchar(dst, tvp.type_name.as_ref())?;
+                // SQL Server requires empty column names for TVP parameters in RPC calls
+                for col in &mut tvp.columns {
+                    col.name = Cow::Borrowed("");
+                }
+                encode_tvp_value(dst, Some(tvp))?;
+            }
+            (ColumnData::Tvp(None), None) => {
+                // Null TVP — write type header with empty names + null marker
+                dst.put_u8(VarLenType::Tvp as u8);
+                crate::tds::codec::token::write_b_varchar(dst, "")?;
+                crate::tds::codec::token::write_b_varchar(dst, "")?;
+                crate::tds::codec::token::write_b_varchar(dst, "")?;
+                encode_tvp_value(dst, None)?;
+            }
             (_, None) => {
                 // None/null
                 dst.put_u8(FixedLenType::Null as u8);
@@ -1926,7 +2045,13 @@ where
             }
         }
 
-        Ok(Some(TvpData { columns, rows }))
+        Ok(Some(TvpData {
+            db_name: Cow::Borrowed(""),
+            schema: Cow::Borrowed(""),
+            type_name: Cow::Borrowed(""),
+            columns,
+            rows,
+        }))
     })
 }
 
@@ -2251,7 +2376,11 @@ mod tests {
             ],
             vec![ColumnData::I32(None), ColumnData::String(None)],
         ];
-        let tvp = TvpData { columns, rows };
+        // Type name/schema/db_name live in the TypeInfo header, not the TVP data
+        // payload, so round-tripped TvpData always has empty names.
+        let tvp = TvpData::new("")
+            .columns(columns)
+            .rows(rows);
         test_round_trip(
             TypeInfo::Tvp(TvpInfo {
                 db_name: "db".into(),
@@ -3005,5 +3134,240 @@ mod tests {
                 panic!("Expected: Error::BulkInput, got: {:?}", err);
             }
         }
+    }
+
+    /// Test that sql_variant encodes correctly when no TypeInfo is provided
+    /// (the RPC parameter path).
+    #[tokio::test]
+    async fn ssvariant_self_describing_encode() {
+        // Build a typed variant payload
+        let variant = VariantData::from_typed(
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
+            ColumnData::I32(Some(42)),
+        )
+        .unwrap();
+
+        let mut buf = BytesMut::new();
+        let mut dst = BytesMutWithTypeInfo::new(&mut buf);
+        ColumnData::Variant(Some(variant.clone()))
+            .encode(&mut dst)
+            .expect("encode must succeed");
+
+        // Decode: first read the TypeInfo header, then decode the value
+        let reader = &mut buf.into_sql_read_bytes();
+        let ti = TypeInfo::decode(reader).await.expect("TypeInfo decode");
+        assert!(matches!(ti, TypeInfo::SsVariant(SsVariantInfo { max_len: 8016 })));
+
+        let decoded = ColumnData::decode(reader, &ti)
+            .await
+            .expect("ColumnData decode");
+        assert_eq!(decoded, ColumnData::Variant(Some(variant)));
+    }
+
+    /// Test that null sql_variant encodes correctly with no TypeInfo.
+    #[tokio::test]
+    async fn ssvariant_null_self_describing_encode() {
+        let mut buf = BytesMut::new();
+        let mut dst = BytesMutWithTypeInfo::new(&mut buf);
+        ColumnData::Variant(None)
+            .encode(&mut dst)
+            .expect("encode must succeed");
+
+        let reader = &mut buf.into_sql_read_bytes();
+        let ti = TypeInfo::decode(reader).await.expect("TypeInfo decode");
+        assert!(matches!(ti, TypeInfo::SsVariant(_)));
+
+        let decoded = ColumnData::decode(reader, &ti)
+            .await
+            .expect("ColumnData decode");
+        assert_eq!(decoded, ColumnData::Variant(None));
+    }
+
+    /// Test that TVP encodes correctly when no TypeInfo is provided
+    /// (the RPC parameter path).
+    #[tokio::test]
+    async fn tvp_self_describing_encode() {
+        let collation = Some(Collation::new(13632521, 52));
+        let tvp = TvpData::new("MyTableType")
+            .schema("dbo")
+            .columns(vec![
+                TvpColumn {
+                    name: Cow::Borrowed("id"),
+                    user_type: 0,
+                    flags: ColumnFlag::Nullable.into(),
+                    ty: TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
+                },
+                TvpColumn {
+                    name: Cow::Borrowed("label"),
+                    user_type: 0,
+                    flags: ColumnFlag::Nullable.into(),
+                    ty: TypeInfo::VarLenSized(VarLenContext::new(
+                        VarLenType::NVarchar,
+                        40,
+                        collation,
+                    )),
+                },
+            ])
+            .rows(vec![
+                vec![
+                    ColumnData::I32(Some(1)),
+                    ColumnData::String(Some("hello".into())),
+                ],
+            ]);
+
+        let mut buf = BytesMut::new();
+        let mut dst = BytesMutWithTypeInfo::new(&mut buf);
+        ColumnData::Tvp(Some(tvp))
+            .encode(&mut dst)
+            .expect("encode must succeed");
+
+        // Decode: first read the TypeInfo header, then decode the TVP value
+        let reader = &mut buf.into_sql_read_bytes();
+        let ti = TypeInfo::decode(reader).await.expect("TypeInfo decode");
+        match &ti {
+            TypeInfo::Tvp(info) => {
+                assert_eq!(info.type_name, "MyTableType");
+                assert_eq!(info.schema, "dbo");
+            }
+            other => panic!("expected TVP TypeInfo, got {:?}", other),
+        }
+
+        let decoded = ColumnData::decode(reader, &ti)
+            .await
+            .expect("ColumnData decode");
+
+        match decoded {
+            ColumnData::Tvp(Some(tvp)) => {
+                assert_eq!(tvp.columns.len(), 2);
+                assert_eq!(tvp.rows.len(), 1);
+                assert_eq!(tvp.rows[0][0], ColumnData::I32(Some(1)));
+                assert_eq!(
+                    tvp.rows[0][1],
+                    ColumnData::String(Some(Cow::Borrowed("hello")))
+                );
+            }
+            other => panic!("expected TVP, got {:?}", other),
+        }
+    }
+
+    /// Test that null TVP encodes correctly with no TypeInfo.
+    #[tokio::test]
+    async fn tvp_null_self_describing_encode() {
+        let mut buf = BytesMut::new();
+        let mut dst = BytesMutWithTypeInfo::new(&mut buf);
+        ColumnData::Tvp(None)
+            .encode(&mut dst)
+            .expect("encode must succeed");
+
+        let reader = &mut buf.into_sql_read_bytes();
+        let ti = TypeInfo::decode(reader).await.expect("TypeInfo decode");
+        assert!(matches!(ti, TypeInfo::Tvp(_)));
+
+        let decoded = ColumnData::decode(reader, &ti)
+            .await
+            .expect("ColumnData decode");
+        assert_eq!(decoded, ColumnData::Tvp(None));
+    }
+
+    /// Test ToSql / IntoSql for VariantData.
+    #[tokio::test]
+    async fn variant_to_sql_into_sql() {
+        use crate::{IntoSql, ToSql};
+
+        let variant = VariantData::from_typed(
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
+            ColumnData::I32(Some(99)),
+        )
+        .unwrap();
+
+        // ToSql (by-ref)
+        let cd = variant.to_sql();
+        assert!(matches!(cd, ColumnData::Variant(Some(_))));
+
+        // IntoSql (by-value)
+        let cd = variant.clone().into_sql();
+        assert!(matches!(cd, ColumnData::Variant(Some(_))));
+
+        // Option<VariantData> None
+        let none: Option<VariantData<'_>> = None;
+        let cd = none.into_sql();
+        assert!(matches!(cd, ColumnData::Variant(None)));
+    }
+
+    /// Test ToSql / IntoSql for TvpData.
+    #[tokio::test]
+    async fn tvp_to_sql_into_sql() {
+        use crate::{IntoSql, ToSql};
+
+        let tvp = TvpData::new("TestType")
+            .schema("dbo")
+            .columns(vec![TvpColumn {
+                name: Cow::Borrowed("col1"),
+                user_type: 0,
+                flags: ColumnFlag::Nullable.into(),
+                ty: TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
+            }])
+            .rows(vec![vec![ColumnData::I32(Some(1))]]);
+
+        // ToSql
+        let cd = tvp.to_sql();
+        assert!(matches!(cd, ColumnData::Tvp(Some(_))));
+
+        // IntoSql
+        let cd = tvp.into_sql();
+        assert!(matches!(cd, ColumnData::Tvp(Some(_))));
+    }
+
+    /// Test FromSql / FromSqlOwned for VariantData.
+    #[tokio::test]
+    async fn variant_from_sql() {
+        use crate::{FromSql, FromSqlOwned};
+
+        let variant = VariantData::from_typed(
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
+            ColumnData::I32(Some(42)),
+        )
+        .unwrap();
+
+        let cd = ColumnData::Variant(Some(variant.clone()));
+
+        // FromSql (borrowed)
+        let result: Option<&VariantData<'static>> =
+            <&VariantData<'static>>::from_sql(&cd).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().payload(), variant.payload());
+
+        // FromSqlOwned
+        let result: Option<VariantData<'static>> =
+            VariantData::from_sql_owned(cd).unwrap();
+        assert!(result.is_some());
+    }
+
+    /// Test FromSql / FromSqlOwned for TvpData.
+    #[tokio::test]
+    async fn tvp_from_sql() {
+        use crate::{FromSql, FromSqlOwned};
+
+        let tvp = TvpData::new("")
+            .columns(vec![TvpColumn {
+                name: Cow::Borrowed("x"),
+                user_type: 0,
+                flags: ColumnFlag::Nullable.into(),
+                ty: TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Intn, 4, None)),
+            }])
+            .rows(vec![vec![ColumnData::I32(Some(7))]]);
+
+        let cd = ColumnData::Tvp(Some(tvp));
+
+        // FromSql (borrowed)
+        let result: Option<&TvpData<'static>> =
+            <&TvpData<'static>>::from_sql(&cd).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().rows.len(), 1);
+
+        // FromSqlOwned
+        let result: Option<TvpData<'static>> =
+            TvpData::from_sql_owned(cd).unwrap();
+        assert!(result.is_some());
     }
 }
