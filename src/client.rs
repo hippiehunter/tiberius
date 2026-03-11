@@ -1,4 +1,5 @@
 mod auth;
+mod cancellation;
 mod config;
 mod connection;
 
@@ -11,6 +12,7 @@ mod tls;
 mod tls_stream;
 
 pub use auth::*;
+pub use cancellation::CancellationToken;
 pub use config::*;
 pub(crate) use connection::*;
 
@@ -350,6 +352,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// Closes this database connection explicitly.
     pub async fn close(self) -> crate::Result<()> {
         self.connection.close().await
+    }
+
+    /// Returns a cancellation token that can be used to cancel in-flight
+    /// queries from another task.
+    ///
+    /// The token is `Clone` and `Send + Sync`, so it can be shared freely.
+    /// Calling [`CancellationToken::cancel()`] causes the active
+    /// [`QueryStream`] to terminate cleanly at its next poll point by
+    /// sending a TDS attention signal to the server.
+    ///
+    /// [`QueryStream`]: struct.QueryStream.html
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.connection.cancellation_token()
+    }
+
+    /// Cancel any pending operation and flush the connection.
+    ///
+    /// Sends an attention signal to the server and drains the response
+    /// stream. This is useful when you need to ensure the connection is
+    /// clean before starting a new operation.
+    ///
+    /// If no operation is pending, this is a no-op.
+    pub async fn cancel(&mut self) -> crate::Result<()> {
+        self.connection.flush_stream().await
     }
 
     pub(crate) fn rpc_params<'a>(query: impl Into<Cow<'a, str>>) -> Vec<RpcParam<'a>> {

@@ -105,6 +105,13 @@ impl PacketHeader {
         header
     }
 
+    pub fn attention(id: u8) -> Self {
+        let mut header = Self::new(0, id);
+        header.set_type(PacketType::AttentionSignal);
+        header.set_status(PacketStatus::EndOfMessage);
+        header
+    }
+
     pub fn set_status(&mut self, status: PacketStatus) {
         self.status = status;
         self.raw_status = status as u8;

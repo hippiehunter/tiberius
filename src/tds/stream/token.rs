@@ -2,8 +2,8 @@ use crate::tds::codec::TokenSspi;
 use crate::{
     client::Connection,
     tds::codec::{
-        TokenAltMetaData, TokenAltRow, TokenColInfo, TokenColMetaData, TokenColName, TokenDone,
-        TokenEnvChange, TokenError, TokenFeatureExtAck, TokenFedAuthInfo, TokenInfo,
+        DoneStatus, TokenAltMetaData, TokenAltRow, TokenColInfo, TokenColMetaData, TokenColName,
+        TokenDone, TokenEnvChange, TokenError, TokenFeatureExtAck, TokenFedAuthInfo, TokenInfo,
         TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow, TokenSessionState, TokenTabName,
     },
     Error, SqlReadBytes, TokenType,
@@ -44,6 +44,7 @@ pub enum ReceivedToken {
 pub(crate) struct TokenStream<'a, S: AsyncRead + AsyncWrite + Unpin + Send> {
     conn: &'a mut Connection<S>,
     last_error: Option<Error>,
+    attention_sent: bool,
 }
 
 impl<'a, S> TokenStream<'a, S>
@@ -54,6 +55,18 @@ where
         Self {
             conn,
             last_error: None,
+            attention_sent: false,
+        }
+    }
+
+    /// Create a token stream that knows an attention signal has already been
+    /// sent externally. This prevents the stream from terminating on a
+    /// natural EOF before the server's attention acknowledgment arrives.
+    pub(crate) fn new_with_attention(conn: &'a mut Connection<S>) -> Self {
+        Self {
+            conn,
+            last_error: None,
+            attention_sent: true,
         }
     }
 
@@ -79,6 +92,30 @@ where
                 }
                 Some(_) => (),
                 None => return Err(crate::Error::Protocol("Never got DONE token.".into())),
+            }
+        }
+    }
+
+    /// Drain the token stream until a DONE token with the Attention flag is
+    /// received. Used after sending an attention signal to quickly flush the
+    /// remaining result data.
+    pub(crate) async fn flush_to_attention(self) -> crate::Result<()> {
+        let mut stream = self.try_unfold();
+
+        loop {
+            match stream.try_next().await? {
+                Some(ReceivedToken::Done(ref done))
+                | Some(ReceivedToken::DoneProc(ref done))
+                | Some(ReceivedToken::DoneInProc(ref done))
+                    if done.status().contains(DoneStatus::Attention) =>
+                {
+                    return Ok(());
+                }
+                Some(_) => continue,
+                // Stream ended naturally — the server may have finished
+                // before it saw our attention. The orphaned attention ack
+                // (if any) will be consumed by the next flush_stream() call.
+                None => return Ok(()),
             }
         }
     }
@@ -297,44 +334,74 @@ where
 
     pub fn try_unfold(self) -> BoxStream<'a, crate::Result<ReceivedToken>> {
         let stream = futures_util::stream::try_unfold(self, |mut this| async move {
-            if this.conn.is_eof() {
-                match this.last_error {
-                    None => return Ok(None),
-                    Some(error) => return Err(error),
+            loop {
+                // Only check for EOF when we're NOT waiting for an attention
+                // acknowledgment. After sending attention, the server will
+                // always send a Done+Attention response, even if the original
+                // query response has already ended (EOM seen). Skipping the
+                // EOF check ensures we keep reading until that ack arrives.
+                if !this.attention_sent && this.conn.is_eof() {
+                    return match this.last_error {
+                        None => Ok(None),
+                        Some(error) => Err(error),
+                    };
                 }
+
+                // Check for cancellation request from CancellationToken
+                if !this.attention_sent && this.conn.is_cancellation_requested() {
+                    this.conn.clear_cancellation_request();
+                    this.conn.send_attention().await?;
+                    this.attention_sent = true;
+                }
+
+                let ty_byte = this.conn.read_u8().await?;
+
+                let ty = TokenType::try_from(ty_byte).map_err(|_| {
+                    Error::Protocol(format!("invalid token type {:x}", ty_byte).into())
+                })?;
+
+                let token = match ty {
+                    TokenType::ReturnStatus => this.get_return_status().await?,
+                    TokenType::AltMetaData => this.get_alt_metadata().await?,
+                    TokenType::ColMetaData => this.get_col_metadata().await?,
+                    TokenType::ColName => this.get_col_name().await?,
+                    TokenType::Row => this.get_row().await?,
+                    TokenType::NbcRow => this.get_nbc_row().await?,
+                    TokenType::AltRow => this.get_alt_row().await?,
+                    TokenType::Done => this.get_done_value().await?,
+                    TokenType::DoneProc => this.get_done_proc_value().await?,
+                    TokenType::DoneInProc => this.get_done_in_proc_value().await?,
+                    TokenType::ReturnValue => this.get_return_value().await?,
+                    TokenType::Error => this.get_error().await?,
+                    TokenType::Order => this.get_order().await?,
+                    TokenType::TabName => this.get_tab_name().await?,
+                    TokenType::ColInfo => this.get_col_info().await?,
+                    TokenType::EnvChange => this.get_env_change().await?,
+                    TokenType::SessionState => this.get_session_state().await?,
+                    TokenType::Info => this.get_info().await?,
+                    TokenType::LoginAck => this.get_login_ack().await?,
+                    TokenType::Sspi => this.get_sspi().await?,
+                    TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
+                    TokenType::FedAuthInfo => this.get_fed_auth_info().await?,
+                };
+
+                // When draining after attention, skip all tokens until we see
+                // Done+Attention, then terminate the stream.
+                if this.attention_sent {
+                    match &token {
+                        ReceivedToken::Done(done)
+                        | ReceivedToken::DoneProc(done)
+                        | ReceivedToken::DoneInProc(done)
+                            if done.status().contains(DoneStatus::Attention) =>
+                        {
+                            return Ok(None);
+                        }
+                        _ => continue,
+                    }
+                }
+
+                return Ok(Some((token, this)));
             }
-
-            let ty_byte = this.conn.read_u8().await?;
-
-            let ty = TokenType::try_from(ty_byte)
-                .map_err(|_| Error::Protocol(format!("invalid token type {:x}", ty_byte).into()))?;
-
-            let token = match ty {
-                TokenType::ReturnStatus => this.get_return_status().await?,
-                TokenType::AltMetaData => this.get_alt_metadata().await?,
-                TokenType::ColMetaData => this.get_col_metadata().await?,
-                TokenType::ColName => this.get_col_name().await?,
-                TokenType::Row => this.get_row().await?,
-                TokenType::NbcRow => this.get_nbc_row().await?,
-                TokenType::AltRow => this.get_alt_row().await?,
-                TokenType::Done => this.get_done_value().await?,
-                TokenType::DoneProc => this.get_done_proc_value().await?,
-                TokenType::DoneInProc => this.get_done_in_proc_value().await?,
-                TokenType::ReturnValue => this.get_return_value().await?,
-                TokenType::Error => this.get_error().await?,
-                TokenType::Order => this.get_order().await?,
-                TokenType::TabName => this.get_tab_name().await?,
-                TokenType::ColInfo => this.get_col_info().await?,
-                TokenType::EnvChange => this.get_env_change().await?,
-                TokenType::SessionState => this.get_session_state().await?,
-                TokenType::Info => this.get_info().await?,
-                TokenType::LoginAck => this.get_login_ack().await?,
-                TokenType::Sspi => this.get_sspi().await?,
-                TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
-                TokenType::FedAuthInfo => this.get_fed_auth_info().await?,
-            };
-
-            Ok(Some((token, this)))
         });
 
         Box::pin(stream)
