@@ -1,0 +1,329 @@
+//! Shared helpers for consuming RPC responses on the client side.
+//!
+//! Prepared-statement and cursor APIs issue RPC calls whose responses arrive
+//! as a mix of optional result sets, zero or more `RETURNVALUE` tokens, and a
+//! `RETURNSTATUS` + `DONEPROC` pair. This module provides the plumbing for
+//! extracting those pieces without duplicating token-walking logic across
+//! every new helper.
+
+use crate::client::Connection;
+use crate::tds::codec::{ColumnData, DoneStatus, TokenReturnValue};
+use crate::tds::stream::{ReceivedToken, TokenStream};
+use crate::FromSql;
+use futures_util::io::{AsyncRead, AsyncWrite};
+use futures_util::stream::{Stream, TryStreamExt};
+
+/// A single `RETURNVALUE` token surfaced to the client.
+///
+/// Use [`get`](Self::get) to decode the value through the same
+/// [`FromSql`](crate::FromSql) machinery that [`Row::get`](crate::Row::get)
+/// uses, so callers don't need to pattern-match on the internal
+/// [`ColumnData`] enum.
+#[derive(Debug, Clone)]
+pub struct OutputValue {
+    name: String,
+    ordinal: u16,
+    value: ColumnData<'static>,
+}
+
+impl OutputValue {
+    /// The parameter name reported by the server. Servers commonly return an
+    /// empty string for positional output parameters and include the `@`
+    /// prefix for named ones.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Positional ordinal assigned by the server. Ordering is not guaranteed
+    /// to be stable across providers; prefer matching on [`name`](Self::name)
+    /// when the server populates it.
+    pub fn ordinal(&self) -> u16 {
+        self.ordinal
+    }
+
+    /// Decode the value as `T` via [`FromSql`].
+    ///
+    /// Returns `Ok(None)` if the value is SQL `NULL`, `Ok(Some(_))` on a
+    /// successful conversion, or `Err(Conversion)` if the stored type
+    /// doesn't map to `T`.
+    pub fn get<'a, T>(&'a self) -> crate::Result<Option<T>>
+    where
+        T: FromSql<'a>,
+    {
+        T::from_sql(&self.value)
+    }
+
+    /// Borrow the raw underlying value. Most callers should prefer
+    /// [`get`](Self::get); this escape hatch exists for users that need to
+    /// inspect an unusual type directly.
+    pub fn raw(&self) -> &ColumnData<'static> {
+        &self.value
+    }
+
+    /// Case-insensitive name compare, ignoring a leading `@` on either side.
+    ///
+    /// Returns `false` if either name is empty after prefix-stripping — the
+    /// server frequently emits empty names for positional outputs, and those
+    /// should not match arbitrary lookup keys.
+    pub fn matches_name(&self, name: &str) -> bool {
+        let a = self.name.strip_prefix('@').unwrap_or(&self.name);
+        let b = name.strip_prefix('@').unwrap_or(name);
+        if a.is_empty() || b.is_empty() {
+            return false;
+        }
+        a.eq_ignore_ascii_case(b)
+    }
+}
+
+impl From<TokenReturnValue> for OutputValue {
+    fn from(tok: TokenReturnValue) -> Self {
+        Self {
+            name: tok.param_name,
+            ordinal: tok.param_ordinal,
+            value: tok.value,
+        }
+    }
+}
+
+/// Collect the output parameters + return status from an RPC call that
+/// produces no result sets (`sp_prepare`, `sp_unprepare`, `sp_cursoropen`,
+/// `sp_cursorclose`).
+///
+/// The stream is drained until a `DONEPROC` / `DONE` token without the
+/// `More` flag is observed. Any `TokenError` is captured (first one wins)
+/// and returned once the `DONEPROC` is consumed so the connection is left
+/// in a clean state.
+pub(crate) async fn collect_rpc_outputs<S>(
+    conn: &mut Connection<S>,
+) -> crate::Result<(Vec<OutputValue>, Option<u32>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let ts = TokenStream::new(conn);
+    let stream = ts.try_unfold();
+    collect_rpc_outputs_from_stream(stream).await
+}
+
+/// Lower-level variant that drains an arbitrary token stream. Exists to
+/// make `collect_rpc_outputs` unit-testable with synthetic inputs.
+pub(crate) async fn collect_rpc_outputs_from_stream<S>(
+    mut stream: S,
+) -> crate::Result<(Vec<OutputValue>, Option<u32>)>
+where
+    S: Stream<Item = crate::Result<ReceivedToken>> + Unpin,
+{
+    let mut outputs = Vec::new();
+    let mut status = None;
+    let mut last_error: Option<crate::Error> = None;
+
+    while let Some(token) = stream.try_next().await? {
+        match token {
+            ReceivedToken::ReturnValue(rv) => outputs.push(rv.into()),
+            ReceivedToken::ReturnStatus(s) => status = Some(s),
+            ReceivedToken::Error(e) => {
+                if last_error.is_none() {
+                    last_error = Some(crate::Error::Server(e));
+                }
+            }
+            ReceivedToken::DoneProc(done) | ReceivedToken::Done(done) => {
+                // DoneProc/Done without the `More` flag marks the end of the
+                // RPC response.
+                if !done.status().contains(DoneStatus::More) {
+                    break;
+                }
+            }
+            // Intermediate DoneInProc can appear if the server emits them
+            // even for no-result ops; skip.
+            ReceivedToken::DoneInProc(_) => {}
+            _ => {}
+        }
+    }
+
+    if let Some(err) = last_error {
+        return Err(err);
+    }
+
+    Ok((outputs, status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tds::codec::{BaseMetaDataColumn, FixedLenType, TokenDone, TokenError, TypeInfo};
+    use enumflags2::BitFlags;
+    use futures_util::stream::iter;
+
+    fn mk_done_proc_final() -> ReceivedToken {
+        ReceivedToken::DoneProc(TokenDone::with_rows(0))
+    }
+
+    fn mk_done_proc_more() -> ReceivedToken {
+        ReceivedToken::DoneProc(TokenDone::with_more_rows(0))
+    }
+
+    fn synthetic(tokens: Vec<ReceivedToken>) -> impl Stream<Item = crate::Result<ReceivedToken>> {
+        iter(tokens.into_iter().map(Ok))
+    }
+
+    fn mk_return_value(name: &str, ordinal: u16, value: ColumnData<'static>) -> TokenReturnValue {
+        TokenReturnValue {
+            param_ordinal: ordinal,
+            param_name: name.to_string(),
+            udf: false,
+            meta: BaseMetaDataColumn {
+                user_type: 0,
+                flags: BitFlags::empty(),
+                ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                table_name: None,
+            },
+            value,
+        }
+    }
+
+    #[test]
+    fn matches_name_handles_at_prefix_and_case() {
+        let ov: OutputValue = mk_return_value("@Handle", 0, ColumnData::I32(Some(7))).into();
+        assert!(ov.matches_name("handle"));
+        assert!(ov.matches_name("@handle"));
+        assert!(ov.matches_name("HANDLE"));
+        assert!(!ov.matches_name("cursor"));
+    }
+
+    #[test]
+    fn matches_name_is_false_for_empty_server_name() {
+        // SQL Server returns empty names for positional outputs; those must
+        // not match arbitrary lookup keys.
+        let ov: OutputValue = mk_return_value("", 0, ColumnData::I32(Some(7))).into();
+        assert!(!ov.matches_name("handle"));
+        assert!(!ov.matches_name(""));
+    }
+
+    #[test]
+    fn matches_name_refuses_empty_query() {
+        let ov: OutputValue = mk_return_value("@handle", 0, ColumnData::I32(Some(7))).into();
+        assert!(!ov.matches_name(""));
+        assert!(!ov.matches_name("@"));
+    }
+
+    #[test]
+    fn get_decodes_i32_via_fromsql() {
+        let ov: OutputValue = mk_return_value("@x", 1, ColumnData::I32(Some(42))).into();
+        assert_eq!(ov.get::<i32>().unwrap(), Some(42));
+    }
+
+    #[test]
+    fn get_returns_none_for_sql_null() {
+        let ov: OutputValue = mk_return_value("@x", 1, ColumnData::I32(None)).into();
+        assert_eq!(ov.get::<i32>().unwrap(), None);
+    }
+
+    #[test]
+    fn get_errors_on_type_mismatch() {
+        let ov: OutputValue =
+            mk_return_value("@x", 1, ColumnData::String(Some("hello".into()))).into();
+        let err = ov.get::<i32>().unwrap_err();
+        assert!(matches!(err, crate::Error::Conversion(_)));
+    }
+
+    #[test]
+    fn raw_accessor_exposes_column_data() {
+        let ov: OutputValue = mk_return_value("@x", 1, ColumnData::I32(Some(42))).into();
+        assert!(matches!(ov.raw(), ColumnData::I32(Some(42))));
+    }
+
+    #[test]
+    fn metadata_accessors() {
+        let ov: OutputValue = mk_return_value("@handle", 3, ColumnData::I32(Some(7))).into();
+        assert_eq!(ov.name(), "@handle");
+        assert_eq!(ov.ordinal(), 3);
+    }
+
+    #[tokio::test]
+    async fn collect_drains_return_value_plus_status_plus_doneproc() {
+        let s = synthetic(vec![
+            ReceivedToken::ReturnValue(mk_return_value("@handle", 1, ColumnData::I32(Some(42)))),
+            ReceivedToken::ReturnStatus(0),
+            mk_done_proc_final(),
+        ]);
+        let (outputs, status) = collect_rpc_outputs_from_stream(s).await.unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].get::<i32>().unwrap(), Some(42));
+        assert_eq!(status, Some(0));
+    }
+
+    #[tokio::test]
+    async fn collect_surfaces_first_token_error_after_draining() {
+        let err = TokenError::new(50000, 1, 16, "test failure", "srv", "proc", 1);
+        let s = synthetic(vec![
+            ReceivedToken::Error(err),
+            ReceivedToken::ReturnStatus(0),
+            mk_done_proc_final(),
+        ]);
+        let result = collect_rpc_outputs_from_stream(s).await;
+        match result {
+            Err(crate::Error::Server(te)) => assert_eq!(te.code, 50000),
+            other => panic!("expected Server error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_keeps_first_error_across_multiple_error_tokens() {
+        let first = TokenError::new(1, 1, 16, "first", "srv", "", 1);
+        let second = TokenError::new(2, 1, 16, "second", "srv", "", 1);
+        let s = synthetic(vec![
+            ReceivedToken::Error(first),
+            ReceivedToken::Error(second),
+            mk_done_proc_final(),
+        ]);
+        match collect_rpc_outputs_from_stream(s).await {
+            Err(crate::Error::Server(te)) => assert_eq!(te.code, 1),
+            other => panic!("expected first error to win, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_skips_done_proc_with_more_flag_and_terminates_on_final() {
+        let s = synthetic(vec![
+            ReceivedToken::ReturnValue(mk_return_value("@a", 1, ColumnData::I32(Some(1)))),
+            mk_done_proc_more(),
+            ReceivedToken::ReturnValue(mk_return_value("@b", 2, ColumnData::I32(Some(2)))),
+            mk_done_proc_final(),
+        ]);
+        let (outputs, _) = collect_rpc_outputs_from_stream(s).await.unwrap();
+        assert_eq!(outputs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn collect_treats_bare_done_like_done_proc() {
+        let s = synthetic(vec![
+            ReceivedToken::ReturnValue(mk_return_value("@a", 1, ColumnData::I32(Some(1)))),
+            ReceivedToken::Done(TokenDone::with_rows(0)),
+        ]);
+        let (outputs, _) = collect_rpc_outputs_from_stream(s).await.unwrap();
+        assert_eq!(outputs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn collect_ignores_intermediate_done_in_proc() {
+        // Servers sometimes emit DoneInProc even for "no-result" RPCs; it
+        // must not terminate our drain loop.
+        let s = synthetic(vec![
+            ReceivedToken::DoneInProc(TokenDone::with_rows(0)),
+            ReceivedToken::ReturnValue(mk_return_value("@handle", 1, ColumnData::I32(Some(7)))),
+            mk_done_proc_final(),
+        ]);
+        let (outputs, _) = collect_rpc_outputs_from_stream(s).await.unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].get::<i32>().unwrap(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn collect_empty_stream_before_done_returns_empty() {
+        // An empty stream (e.g. connection closed) should not panic; it
+        // returns no outputs and no status.
+        let s = synthetic(vec![mk_done_proc_final()]);
+        let (outputs, status) = collect_rpc_outputs_from_stream(s).await.unwrap();
+        assert!(outputs.is_empty());
+        assert!(status.is_none());
+    }
+}

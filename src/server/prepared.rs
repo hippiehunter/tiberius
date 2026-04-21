@@ -53,80 +53,18 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::tds::codec::TypeInfo;
 
-/// A handle to a prepared statement.
-///
-/// This is an opaque identifier returned by `sp_prepare` that clients use
-/// to reference the prepared statement in subsequent `sp_execute` and
-/// `sp_unprepare` calls.
-///
-/// The handle encodes both a connection ID (upper 16 bits) and a sequence
-/// number (lower 16 bits) to ensure uniqueness across connections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PreparedHandle(i32);
-
-impl PreparedHandle {
-    /// Create a new prepared handle from a connection ID and sequence number.
+crate::server::handle_macro::impl_server_handle! {
+    /// A handle to a prepared statement.
     ///
-    /// The handle is constructed by combining the connection ID (upper 16 bits)
-    /// with the sequence number (lower 16 bits).
-    ///
-    /// # Arguments
-    ///
-    /// * `conn_id` - The connection identifier
-    /// * `sequence` - The sequence number within this connection
-    ///
-    /// # Returns
-    ///
-    /// A new `PreparedHandle` encoding both values.
-    pub fn new(conn_id: u16, sequence: u16) -> Self {
-        let value = ((conn_id as i32) << 16) | (sequence as i32);
-        Self(value)
-    }
-
-    /// Get the raw i32 value of this handle.
-    ///
-    /// This is the value that should be sent to clients in protocol messages.
-    #[inline]
-    pub fn as_i32(&self) -> i32 {
-        self.0
-    }
-
-    /// Create a handle from a raw i32 value.
-    ///
-    /// This is used when receiving a handle from client protocol messages.
-    #[inline]
-    pub fn from_i32(value: i32) -> Self {
-        Self(value)
-    }
-
-    /// Extract the connection ID from this handle.
-    #[inline]
-    pub fn conn_id(&self) -> u16 {
-        ((self.0 >> 16) & 0xFFFF) as u16
-    }
-
-    /// Extract the sequence number from this handle.
-    #[inline]
-    pub fn sequence(&self) -> u16 {
-        (self.0 & 0xFFFF) as u16
-    }
-}
-
-impl From<i32> for PreparedHandle {
-    fn from(value: i32) -> Self {
-        Self::from_i32(value)
-    }
-}
-
-impl From<PreparedHandle> for i32 {
-    fn from(handle: PreparedHandle) -> Self {
-        handle.as_i32()
-    }
+    /// Opaque identifier returned by `sp_prepare` that clients use to
+    /// reference the prepared statement in subsequent `sp_execute` and
+    /// `sp_unprepare` calls. Encodes a connection ID (upper 16 bits) and a
+    /// sequence number (lower 16 bits) for uniqueness across connections.
+    pub PreparedHandle
 }
 
 /// A cached prepared statement.
@@ -229,10 +167,9 @@ impl Default for ProcedureCacheConfig {
 ///
 /// # Thread Safety
 ///
-/// The cache uses `AtomicU16` for handle sequence generation, making it
-/// safe to share between threads if wrapped in appropriate synchronization
-/// primitives. However, the `HashMap` itself is not thread-safe, so
-/// exclusive access is required for mutation.
+/// All mutating methods take `&mut self`, so a plain `u16` suffices for
+/// the sequence counter — no atomics needed. Callers that want to share a
+/// cache across tasks must provide their own synchronisation.
 ///
 /// # Example
 ///
@@ -254,7 +191,7 @@ pub struct ProcedureCache {
     conn_id: u16,
 
     /// The next sequence number for handle generation.
-    next_sequence: AtomicU16,
+    next_sequence: u16,
 
     /// The cached prepared statements.
     statements: HashMap<PreparedHandle, PreparedStatement>,
@@ -290,7 +227,7 @@ impl ProcedureCache {
     pub fn with_config(conn_id: u16, config: ProcedureCacheConfig) -> Self {
         Self {
             conn_id,
-            next_sequence: AtomicU16::new(1),
+            next_sequence: 1,
             statements: HashMap::new(),
             config,
         }
@@ -333,7 +270,8 @@ impl ProcedureCache {
         }
 
         // Generate a new handle
-        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
         let handle = PreparedHandle::new(self.conn_id, sequence);
 
         // Create and store the statement
@@ -490,7 +428,7 @@ impl std::fmt::Debug for ProcedureCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProcedureCache")
             .field("conn_id", &self.conn_id)
-            .field("next_sequence", &self.next_sequence.load(Ordering::Relaxed))
+            .field("next_sequence", &self.next_sequence)
             .field("statements_count", &self.statements.len())
             .field("config", &self.config)
             .finish()

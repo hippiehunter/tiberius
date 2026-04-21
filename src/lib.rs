@@ -269,7 +269,10 @@ mod tds;
 mod sql_browser;
 pub mod server;
 
-pub use client::{AuthMethod, CancellationToken, Client, Config};
+pub use client::{
+    AuthMethod, CancellationToken, Client, Config, Cursor, CursorConcurrencyOptions, CursorHandle,
+    CursorOpenOptions, CursorScrollOptions, Fetch, OutputValue, PreparedHandle, PreparedStatement,
+};
 pub(crate) use error::Error;
 pub use from_sql::{FromSql, FromSqlOwned};
 pub use query::Query;

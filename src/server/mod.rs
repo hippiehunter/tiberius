@@ -99,14 +99,17 @@ pub mod builder;
 pub mod codec;
 pub mod connection;
 pub mod handler;
+mod handle_macro;
 pub mod messages;
 pub mod prepared;
 pub mod query;
 pub mod response;
 pub mod router;
 pub mod server;
+pub mod sp_cursor;
 pub mod sp_executesql;
 pub mod sp_prepare;
+pub mod sp_prepexec;
 pub mod state;
 pub mod tls;
 
@@ -143,6 +146,15 @@ pub use sp_prepare::{
     parse_execute, parse_prepare, parse_unprepare, ParsedExecute, ParsedPrepare, ParsedUnprepare,
     PreparedStatementRpcHandler, SpExecuteHandler, SpExecuteRpcHandler, SpPrepareHandler,
     SpPrepareRpcHandler, SpUnprepareHandler, SpUnprepareRpcHandler,
+};
+pub use sp_prepexec::{
+    parse_prepexec, ParsedPrepExec, SpPrepExecHandler, SpPrepExecRpcHandler,
+};
+pub use sp_cursor::{
+    parse_cursor_close, parse_cursor_fetch, parse_cursor_open, CursorCache, CursorCacheConfig,
+    CursorEntry, CursorHandle, ParsedCursorClose, ParsedCursorFetch, ParsedCursorOpen,
+    SpCursorCloseHandler, SpCursorCloseRpcHandler, SpCursorFetchHandler, SpCursorFetchRpcHandler,
+    SpCursorOpenHandler, SpCursorOpenRpcHandler,
 };
 pub use query::{QueryColumn, QueryColumnType, QueryHandler, QueryOutput, SimpleQueryAdapter};
 pub use router::{RejectUnknownProc, SystemProcRouter, SystemProcRouterBuilder};

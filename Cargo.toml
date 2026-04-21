@@ -23,6 +23,15 @@ path = "tests/query.rs"
 name = "query"
 
 [[test]]
+path = "tests/rpc_helpers.rs"
+name = "rpc_helpers"
+required-features = ["server-smol"]
+
+[[test]]
+path = "tests/rpc_helpers_live.rs"
+name = "rpc_helpers_live"
+
+[[test]]
 path = "tests/named-instance-async.rs"
 name = "named-instance-async"
 required-features = ["sql-browser-async-std"]
