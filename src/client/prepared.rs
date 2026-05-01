@@ -31,6 +31,10 @@ use crate::{Client, ToSql};
 pub struct PreparedHandle(i32);
 
 impl PreparedHandle {
+    pub(crate) fn from_i32(value: i32) -> Self {
+        Self(value)
+    }
+
     /// Raw wire value. Mainly useful for logging; pass the typed
     /// [`PreparedHandle`] around instead of the `i32` whenever possible.
     pub fn as_i32(self) -> i32 {
