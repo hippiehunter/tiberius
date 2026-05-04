@@ -317,6 +317,8 @@ fn decode_rpc(mut payload: BytesMut, status_bits: u8) -> Result<RpcMessage> {
 fn rpc_proc_id_from_u16(id: u16) -> Option<RpcProcId> {
     match id as u8 {
         2 => Some(RpcProcId::CursorOpen),
+        5 => Some(RpcProcId::CursorPrepExec),
+        6 => Some(RpcProcId::CursorUnprepare),
         7 => Some(RpcProcId::CursorFetch),
         9 => Some(RpcProcId::CursorClose),
         10 => Some(RpcProcId::ExecuteSQL),

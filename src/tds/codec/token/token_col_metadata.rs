@@ -6,7 +6,7 @@ use std::{
 use crate::{
     error::Error,
     tds::codec::{Encode, FixedLenType, TokenType, TypeInfo, VarLenType},
-    Column, ColumnData, ColumnType, SqlReadBytes,
+    Column, ColumnData, SqlReadBytes,
 };
 use asynchronous_codec::BytesMut;
 use bytes::BufMut;
@@ -347,10 +347,10 @@ impl TokenColMetaData<'static> {
 
 impl<'a> TokenColMetaData<'a> {
     pub(crate) fn columns(&self) -> impl Iterator<Item = Column> + '_ {
-        self.columns.iter().map(|x| Column {
-            name: x.col_name.to_string(),
-            column_type: ColumnType::from(&x.base.ty),
-        })
+        self.columns
+            .iter()
+            .enumerate()
+            .map(|(ordinal, column)| Column::from_metadata(ordinal, column))
     }
 }
 

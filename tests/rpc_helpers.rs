@@ -16,8 +16,8 @@ use enumflags2::BitFlags;
 use futures_util::sink::SinkExt;
 
 use tiberius::server::sp_cursor::{
-    CursorCache, CursorEntry, CursorHandle, ParsedCursorClose, ParsedCursorFetch,
-    ParsedCursorOpen, SpCursorCloseHandler, SpCursorFetchHandler, SpCursorOpenHandler,
+    CursorCache, CursorEntry, CursorHandle, ParsedCursorClose, ParsedCursorFetch, ParsedCursorOpen,
+    SpCursorCloseHandler, SpCursorFetchHandler, SpCursorOpenHandler,
 };
 use tiberius::server::{
     process_connection, send_output_param, send_output_params, send_return_status, AuthBuilder,
@@ -29,8 +29,8 @@ use tiberius::server::{
     TdsAuthHandler, TdsBackendMessage, TdsClient, TdsServerHandlers,
 };
 use tiberius::{
-    BaseMetaDataColumn, Client, ColumnData, Config, CursorOpenOptions, EncryptionLevel,
-    FixedLenType, MetaDataColumn, TokenDone, TypeInfo,
+    BaseMetaDataColumn, Client, ColumnData, ColumnFlag, Config, CursorOpenOptions, EncryptionLevel,
+    FixedLenType, MetaDataColumn, RpcProcId, TokenDone, TypeInfo,
 };
 
 // =============================================================================
@@ -118,7 +118,9 @@ impl SqlBatchHandler for NoopSqlBatch {
     {
         Box::pin(async move {
             client
-                .send(TdsBackendMessage::Token(BackendToken::Done(TokenDone::with_rows(0))))
+                .send(TdsBackendMessage::Token(BackendToken::Done(
+                    TokenDone::with_rows(0),
+                )))
                 .await
         })
     }
@@ -137,6 +139,7 @@ struct SharedState {
     /// observed. Tests assert on this to prove the client's wire encoding
     /// of (fetch_type, row_num, n_rows) actually reaches the server.
     cursor_fetch_log: Mutex<Vec<(i32, i32, i32)>>,
+    rpc_log: Mutex<Vec<RpcProcId>>,
 }
 
 impl SharedState {
@@ -146,6 +149,7 @@ impl SharedState {
             cursors: Mutex::new(CursorCache::new(1)),
             cursor_rows: Mutex::new(HashMap::new()),
             cursor_fetch_log: Mutex::new(Vec::new()),
+            rpc_log: Mutex::new(Vec::new()),
         }
     }
 }
@@ -173,9 +177,7 @@ fn eval_sql(sql: &str, params: &HashMap<String, i32>) -> Vec<i32> {
         let b = params.get("@P2").copied().unwrap_or(0);
         return vec![a + b];
     }
-    if sql.eq_ignore_ascii_case(
-        "SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT 3 AS v",
-    ) {
+    if sql.eq_ignore_ascii_case("SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT 3 AS v") {
         return vec![1, 2, 3];
     }
     // Fail loud rather than silently returning an empty result set — real
@@ -193,7 +195,7 @@ fn int_int_column() -> MetaDataColumn<'static> {
     MetaDataColumn {
         base: BaseMetaDataColumn {
             user_type: 0,
-            flags: BitFlags::empty(),
+            flags: BitFlags::from(ColumnFlag::Nullable),
             ty: TypeInfo::FixedLen(FixedLenType::Int4),
             table_name: None,
         },
@@ -260,7 +262,12 @@ impl SpPrepareHandler for TestPrepare {
     {
         Box::pin(async move {
             let sql = request.sql().to_string();
-            let handle = self.0.procs.lock().unwrap().prepare(sql, Vec::new(), Vec::new());
+            let handle = self
+                .0
+                .procs
+                .lock()
+                .unwrap()
+                .prepare(sql, Vec::new(), Vec::new());
 
             send_output_param(
                 client,
@@ -424,9 +431,14 @@ impl SpCursorOpenHandler for TestCursorOpen {
             let scrollopt = request.scrollopt;
             let ccopt = request.ccopt;
 
-            let entry = CursorEntry::new(request.sql.to_string(), scrollopt, ccopt, rows.len() as i32);
+            let entry =
+                CursorEntry::new(request.sql.to_string(), scrollopt, ccopt, rows.len() as i32);
             let handle = self.0.cursors.lock().unwrap().open(entry);
-            self.0.cursor_rows.lock().unwrap().insert(handle, rows.clone());
+            self.0
+                .cursor_rows
+                .lock()
+                .unwrap()
+                .insert(handle, rows.clone());
 
             // Build output parameters in the order the spec declares.
             let outputs = vec![
@@ -467,6 +479,7 @@ impl SpCursorFetchHandler for TestCursorFetch {
         C: TdsClient + 'a,
     {
         Box::pin(async move {
+            self.0.rpc_log.lock().unwrap().push(RpcProcId::CursorFetch);
             // Record the fetch params so tests can assert the client's
             // wire encoding of (fetch_type, row_num, n_rows) survived the
             // round trip.
@@ -505,6 +518,7 @@ impl SpCursorCloseHandler for TestCursorClose {
         C: TdsClient + 'a,
     {
         Box::pin(async move {
+            self.0.rpc_log.lock().unwrap().push(RpcProcId::CursorClose);
             self.0.cursors.lock().unwrap().close(&request.handle);
             self.0.cursor_rows.lock().unwrap().remove(&request.handle);
             send_return_status(client, 0).await?;
@@ -531,7 +545,7 @@ type TestRouter = SystemProcRouter<
     TestCursorOpen,
     TestCursorFetch,
     TestCursorClose,
-    RejectIt,
+    SpecialRpc,
 >;
 
 struct RejectIt;
@@ -549,6 +563,130 @@ impl RpcHandler for RejectIt {
             Err(tiberius::error::Error::Protocol(
                 "test harness: unexpected RPC".into(),
             ))
+        })
+    }
+}
+
+struct SpecialRpc(Arc<SharedState>);
+
+impl RpcHandler for SpecialRpc {
+    fn on_rpc<'a, C>(
+        &'a self,
+        client: &'a mut C,
+        message: tiberius::server::RpcMessage,
+    ) -> BoxFuture<'a, tiberius::Result<()>>
+    where
+        C: TdsClient + 'a,
+    {
+        Box::pin(async move {
+            match message.proc_id {
+                Some(RpcProcId::CursorPrepExec) => {
+                    self.0
+                        .rpc_log
+                        .lock()
+                        .unwrap()
+                        .push(RpcProcId::CursorPrepExec);
+                    let params = message.into_param_set().await?;
+                    let all = params.all();
+                    assert!(
+                        all.len() >= 7,
+                        "sp_cursorprepexec expected at least 7 params, got {}",
+                        all.len()
+                    );
+                    assert!(all[0].is_output());
+                    assert!(all[1].is_output());
+                    assert!(all[4].is_output());
+                    assert!(all[5].is_output());
+                    assert!(all[6].is_output());
+
+                    let sql = match &all[3].value {
+                        ColumnData::String(Some(s)) => s.to_string(),
+                        other => panic!("sp_cursorprepexec @stmt was not a string: {:?}", other),
+                    };
+                    let mut values = HashMap::new();
+                    for p in &all[7..] {
+                        if let ColumnData::I32(Some(v)) = &p.value {
+                            values.insert(p.name.clone(), *v);
+                        }
+                    }
+                    let rows = eval_sql(&sql, &values);
+
+                    let prepared_handle =
+                        self.0
+                            .procs
+                            .lock()
+                            .unwrap()
+                            .prepare(sql.clone(), Vec::new(), Vec::new());
+                    let scrollopt = match &all[4].value {
+                        ColumnData::I32(Some(v)) => *v,
+                        _ => 0,
+                    };
+                    let ccopt = match &all[5].value {
+                        ColumnData::I32(Some(v)) => *v,
+                        _ => 0,
+                    };
+                    let cursor_entry = CursorEntry::new(sql, scrollopt, ccopt, rows.len() as i32);
+                    let cursor_handle = self.0.cursors.lock().unwrap().open(cursor_entry);
+                    self.0
+                        .cursor_rows
+                        .lock()
+                        .unwrap()
+                        .insert(cursor_handle, rows.clone());
+
+                    let outputs = vec![
+                        OutputParameter::from_input(
+                            &all[0],
+                            ColumnData::I32(Some(prepared_handle.as_i32())),
+                        )
+                        .with_ordinal(1),
+                        OutputParameter::from_input(
+                            &all[1],
+                            ColumnData::I32(Some(cursor_handle.as_i32())),
+                        )
+                        .with_ordinal(2),
+                        OutputParameter::from_input(&all[4], ColumnData::I32(Some(scrollopt)))
+                            .with_ordinal(5),
+                        OutputParameter::from_input(&all[5], ColumnData::I32(Some(ccopt)))
+                            .with_ordinal(6),
+                        OutputParameter::from_input(
+                            &all[6],
+                            ColumnData::I32(Some(rows.len() as i32)),
+                        )
+                        .with_ordinal(7),
+                    ];
+                    send_output_params(client, outputs).await?;
+                    send_return_status(client, 0).await?;
+                    client
+                        .send(TdsBackendMessage::Token(BackendToken::DoneProc(
+                            TokenDone::with_rows(0),
+                        )))
+                        .await?;
+                    Ok(())
+                }
+                Some(RpcProcId::CursorUnprepare) => {
+                    self.0
+                        .rpc_log
+                        .lock()
+                        .unwrap()
+                        .push(RpcProcId::CursorUnprepare);
+                    let params = message.into_param_set().await?;
+                    let handle = match params.get(0).map(|p| &p.value) {
+                        Some(ColumnData::I32(Some(v))) => PreparedHandle::from_i32(*v),
+                        other => panic!("sp_cursorunprepare handle was not i32: {:?}", other),
+                    };
+                    self.0.procs.lock().unwrap().unprepare(&handle);
+                    send_return_status(client, 0).await?;
+                    client
+                        .send(TdsBackendMessage::Token(BackendToken::DoneProc(
+                            TokenDone::with_rows(0),
+                        )))
+                        .await?;
+                    Ok(())
+                }
+                _ => Err(tiberius::error::Error::Protocol(
+                    "test harness: unexpected RPC".into(),
+                )),
+            }
         })
     }
 }
@@ -594,7 +732,7 @@ impl TestHandlers {
             .with_cursor_open(TestCursorOpen(state.clone()))
             .with_cursor_fetch(TestCursorFetch(state.clone()))
             .with_cursor_close(TestCursorClose(state.clone()))
-            .with_fallback(RejectIt)
+            .with_fallback(SpecialRpc(state.clone()))
             .build();
         Self {
             auth: TestAuth::new(),
@@ -644,12 +782,13 @@ async fn run_server_once(
     handlers: Arc<TestHandlers>,
 ) -> tiberius::Result<()> {
     use tiberius::server::backend::smol_net::SmolStream;
-    let (stream, _addr) = listener.accept().await.map_err(|e| {
-        tiberius::error::Error::Io {
+    let (stream, _addr) = listener
+        .accept()
+        .await
+        .map_err(|e| tiberius::error::Error::Io {
             kind: e.kind(),
             message: e.to_string(),
-        }
-    })?;
+        })?;
     let stream = SmolStream::new(stream);
     let tls: Option<tiberius::server::NoTls> = None;
     process_connection(stream, tls, &*handlers).await
@@ -658,12 +797,13 @@ async fn run_server_once(
 async fn connect_client(
     addr: SocketAddr,
 ) -> tiberius::Result<Client<smol_adapter::Compat<async_net::TcpStream>>> {
-    let stream = async_net::TcpStream::connect(addr).await.map_err(|e| {
-        tiberius::error::Error::Io {
-            kind: e.kind(),
-            message: e.to_string(),
-        }
-    })?;
+    let stream =
+        async_net::TcpStream::connect(addr)
+            .await
+            .map_err(|e| tiberius::error::Error::Io {
+                kind: e.kind(),
+                message: e.to_string(),
+            })?;
     stream.set_nodelay(true).ok();
     let mut config = Config::new();
     config.host(addr.ip().to_string());
@@ -850,6 +990,73 @@ fn open_fetch_close_cursor() {
 }
 
 #[test]
+fn cursor_prep_exec_fetch_close_unprepare() {
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            let mut client = connect_client(addr).await.unwrap();
+
+            let mut cursor = client
+                .cursor_prep_exec(
+                    "SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT 3 AS v",
+                    CursorOpenOptions::default(),
+                    "",
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_ne!(cursor.prepared_handle().as_i32(), 0);
+            assert_ne!(cursor.cursor_handle().as_i32(), 0);
+            assert_eq!(cursor.row_count(), 3);
+
+            let mut stream = cursor
+                .fetch(&mut client, tiberius::Fetch::Next { count: 142 })
+                .await
+                .unwrap();
+            let columns = stream.columns().await.unwrap().unwrap();
+            assert_eq!(columns[0].name(), "v");
+            assert_eq!(columns[0].ordinal(), Some(0));
+            assert_eq!(
+                columns[0].type_info(),
+                Some(&TypeInfo::FixedLen(FixedLenType::Int4))
+            );
+            assert_eq!(columns[0].fixed_len_type(), Some(FixedLenType::Int4));
+            assert!(columns[0].flags().contains(ColumnFlag::Nullable));
+            assert!(columns[0].is_nullable());
+
+            let rows = stream.into_first_result().await.unwrap();
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0].get::<i32, _>(0), Some(1));
+            assert_eq!(
+                rows[0].columns()[0].type_info(),
+                Some(&TypeInfo::FixedLen(FixedLenType::Int4))
+            );
+            assert!(rows[0].columns()[0].flags().contains(ColumnFlag::Nullable));
+            assert_eq!(rows[1].get::<i32, _>(0), Some(2));
+            assert_eq!(rows[2].get::<i32, _>(0), Some(3));
+
+            let seen_fetches = state.cursor_fetch_log.lock().unwrap().clone();
+            assert_eq!(seen_fetches, vec![(0x0002, 0, 142)]);
+
+            cursor.close_cursor(&mut client).await.unwrap();
+            cursor.close_cursor(&mut client).await.unwrap();
+            cursor.unprepare(&mut client).await.unwrap();
+
+            let seen_rpcs = state.rpc_log.lock().unwrap().clone();
+            assert_eq!(
+                seen_rpcs,
+                vec![
+                    RpcProcId::CursorPrepExec,
+                    RpcProcId::CursorFetch,
+                    RpcProcId::CursorClose,
+                    RpcProcId::CursorUnprepare,
+                ]
+            );
+        })
+        .await;
+    });
+}
+
+#[test]
 fn cursor_fetch_encodes_all_directions() {
     // Drives every `Fetch` variant and asserts the server sees the right
     // (fetch_type, row_num, count) triple for each. Catches bugs where the
@@ -872,8 +1079,17 @@ fn cursor_fetch_encodes_all_directions() {
                 (tiberius::Fetch::Next { count: 2 }, (0x0002, 0, 2)),
                 (tiberius::Fetch::Prev { count: 3 }, (0x0004, 0, 3)),
                 (tiberius::Fetch::Last { count: 4 }, (0x0008, 0, 4)),
-                (tiberius::Fetch::Absolute { row: 9, count: 5 }, (0x0010, 9, 5)),
-                (tiberius::Fetch::Relative { offset: -7, count: 6 }, (0x0020, -7, 6)),
+                (
+                    tiberius::Fetch::Absolute { row: 9, count: 5 },
+                    (0x0010, 9, 5),
+                ),
+                (
+                    tiberius::Fetch::Relative {
+                        offset: -7,
+                        count: 6,
+                    },
+                    (0x0020, -7, 6),
+                ),
                 (tiberius::Fetch::Refresh { count: 1 }, (0x0080, 0, 1)),
             ];
 
@@ -906,10 +1122,7 @@ fn cancellation_mid_query_surfaces_as_error() {
     smol::block_on(async {
         with_server(|addr, _state| async move {
             let mut client = connect_client(addr).await.unwrap();
-            let stmt = client
-                .prepare("SELECT @P1 AS v", "@P1 int")
-                .await
-                .unwrap();
+            let stmt = client.prepare("SELECT @P1 AS v", "@P1 int").await.unwrap();
 
             // Issue the query so bytes are in flight, then cancel before
             // consuming the response.
@@ -922,10 +1135,7 @@ fn cancellation_mid_query_surfaces_as_error() {
             let _ = stream.into_results().await;
 
             // Connection is still reusable after cancellation drain.
-            let stmt2 = client
-                .prepare("SELECT @P1 AS v", "@P1 int")
-                .await
-                .unwrap();
+            let stmt2 = client.prepare("SELECT @P1 AS v", "@P1 int").await.unwrap();
             let row = stmt2
                 .query(&mut client, &[&42i32])
                 .await
@@ -956,10 +1166,7 @@ fn prepared_statement_is_marked_released_after_unprepare() {
     smol::block_on(async {
         with_server(|addr, _state| async move {
             let mut client = connect_client(addr).await.unwrap();
-            let stmt = client
-                .prepare("SELECT @P1 AS v", "@P1 int")
-                .await
-                .unwrap();
+            let stmt = client.prepare("SELECT @P1 AS v", "@P1 int").await.unwrap();
             // Explicitly drop without unprepare — exercises the Drop warn
             // path. Test passes as long as this doesn't panic / hang.
             drop(stmt);
@@ -967,4 +1174,3 @@ fn prepared_statement_is_marked_released_after_unprepare() {
         .await;
     });
 }
-

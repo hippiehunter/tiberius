@@ -17,7 +17,7 @@ use tracing::{event, Level};
 use crate::client::rpc_response::{collect_rpc_outputs, OutputValue};
 use crate::tds::codec::{ColumnData, RpcParam, RpcProcId, RpcStatus};
 use crate::tds::stream::{QueryStream, TokenStream};
-use crate::{Client, ToSql};
+use crate::{Client, PreparedHandle, ToSql};
 
 /// Scroll options for `sp_cursoropen` (TDS §2.2.6.7).
 ///
@@ -215,6 +215,114 @@ impl From<CursorHandle> for i32 {
     }
 }
 
+/// A cursor opened by `sp_cursorprepexec` together with its prepared handle.
+///
+/// The prepared handle and cursor handle are separate server-side resources.
+/// Call [`close_and_unprepare`](Self::close_and_unprepare), or close the
+/// cursor and unprepare the statement explicitly.
+#[derive(Debug)]
+pub struct PreparedCursor {
+    prepared_handle: PreparedHandle,
+    cursor: Option<Cursor>,
+    cursor_handle: CursorHandle,
+    scrollopt: BitFlags<CursorScrollOptions>,
+    ccopt: BitFlags<CursorConcurrencyOptions>,
+    row_count: i32,
+    released: bool,
+}
+
+impl PreparedCursor {
+    /// The server-assigned prepared statement handle.
+    pub fn prepared_handle(&self) -> PreparedHandle {
+        self.prepared_handle
+    }
+
+    /// The server-assigned cursor handle.
+    pub fn cursor_handle(&self) -> CursorHandle {
+        self.cursor_handle
+    }
+
+    /// Negotiated scroll flags returned by the server.
+    pub fn scroll_options(&self) -> BitFlags<CursorScrollOptions> {
+        self.scrollopt
+    }
+
+    /// Negotiated concurrency flags returned by the server.
+    pub fn concurrency_options(&self) -> BitFlags<CursorConcurrencyOptions> {
+        self.ccopt
+    }
+
+    /// Server-reported row count, or `-1` if unknown.
+    pub fn row_count(&self) -> i32 {
+        self.row_count
+    }
+
+    /// Fetch rows from the opened cursor.
+    pub async fn fetch<'a, S>(
+        &self,
+        client: &'a mut Client<S>,
+        fetch: Fetch,
+    ) -> crate::Result<QueryStream<'a>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let cursor = self.cursor.as_ref().ok_or_else(|| {
+            crate::Error::Protocol("prepared cursor: cursor is already closed".into())
+        })?;
+        cursor.fetch(client, fetch).await
+    }
+
+    /// Close the cursor if it is still open.
+    ///
+    /// This is idempotent at the wrapper level.
+    pub async fn close_cursor<S>(&mut self, client: &mut Client<S>) -> crate::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        if let Some(cursor) = self.cursor.take() {
+            cursor.close(client).await?;
+        }
+        Ok(())
+    }
+
+    /// Release the prepared handle, closing the cursor first if needed.
+    pub async fn unprepare<S>(mut self, client: &mut Client<S>) -> crate::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        self.close_cursor(client).await?;
+        client.connection.flush_stream().await?;
+        let handle_param = build_cursorunprepare_param(self.prepared_handle);
+        client
+            .send_rpc(RpcProcId::CursorUnprepare, vec![handle_param])
+            .await?;
+        self.released = true;
+        collect_rpc_outputs(&mut client.connection).await?;
+        Ok(())
+    }
+
+    /// Close the cursor and release the prepared handle.
+    pub async fn close_and_unprepare<S>(self, client: &mut Client<S>) -> crate::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        self.unprepare(client).await
+    }
+}
+
+impl Drop for PreparedCursor {
+    fn drop(&mut self) {
+        if !self.released {
+            event!(
+                Level::WARN,
+                prepared_handle = self.prepared_handle.as_i32(),
+                cursor_handle = self.cursor_handle.as_i32(),
+                "PreparedCursor dropped without unprepare; server-side handle will leak until the connection closes"
+            );
+        }
+    }
+}
+
 /// A server-side cursor handle.
 ///
 /// Obtain via [`Client::open_cursor`](crate::Client::open_cursor). Page
@@ -400,6 +508,69 @@ pub(crate) fn build_cursoropen_params<'a>(
     rpc_params
 }
 
+/// Build the RPC parameter list for `sp_cursorprepexec`:
+/// `[@prepared_handle OUT, @cursor OUT, @params, @stmt, @scrollopt OUT,
+///   @ccopt OUT, @rowcount OUT, @P1, @P2, ...]`.
+pub(crate) fn build_cursorprepexec_params<'a>(
+    sql: Cow<'a, str>,
+    options: CursorOpenOptions,
+    param_defs: Cow<'a, str>,
+    params: &[&'a dyn ToSql],
+) -> Vec<RpcParam<'a>> {
+    let mut rpc_params: Vec<RpcParam<'a>> = Vec::with_capacity(params.len() + 7);
+    rpc_params.push(RpcParam {
+        name: Cow::Borrowed(""),
+        flags: RpcStatus::ByRefValue.into(),
+        value: ColumnData::I32(Some(0)),
+    });
+    rpc_params.push(RpcParam {
+        name: Cow::Borrowed(""),
+        flags: RpcStatus::ByRefValue.into(),
+        value: ColumnData::I32(Some(0)),
+    });
+    rpc_params.push(RpcParam {
+        name: Cow::Borrowed(""),
+        flags: BitFlags::empty(),
+        value: ColumnData::String(Some(param_defs)),
+    });
+    rpc_params.push(RpcParam {
+        name: Cow::Borrowed(""),
+        flags: BitFlags::empty(),
+        value: ColumnData::String(Some(sql)),
+    });
+    rpc_params.push(RpcParam {
+        name: Cow::Borrowed(""),
+        flags: RpcStatus::ByRefValue.into(),
+        value: ColumnData::I32(Some(flags_to_i32(options.scroll.bits()))),
+    });
+    rpc_params.push(RpcParam {
+        name: Cow::Borrowed(""),
+        flags: RpcStatus::ByRefValue.into(),
+        value: ColumnData::I32(Some(flags_to_i32(options.concurrency.bits()))),
+    });
+    rpc_params.push(RpcParam {
+        name: Cow::Borrowed(""),
+        flags: RpcStatus::ByRefValue.into(),
+        value: ColumnData::I32(Some(0)),
+    });
+    for (i, p) in params.iter().enumerate() {
+        rpc_params.push(RpcParam {
+            name: Cow::Owned(format!("@P{}", i + 1)),
+            flags: BitFlags::empty(),
+            value: p.to_sql(),
+        });
+    }
+    rpc_params
+}
+
+pub(crate) fn build_cursorunprepare_param(handle: PreparedHandle) -> RpcParam<'static> {
+    RpcParam {
+        name: Cow::Borrowed(""),
+        flags: BitFlags::empty(),
+        value: ColumnData::I32(Some(handle.as_i32())),
+    }
+}
+
 /// Build a [`Cursor`] from the output parameters returned by `sp_cursoropen`.
 ///
 /// Real SQL Server returns outputs with empty names in positional order
@@ -436,9 +607,75 @@ pub(crate) fn cursor_from_outputs(outputs: &[OutputValue]) -> crate::Result<Curs
     })
 }
 
+/// Build a [`PreparedCursor`] from `sp_cursorprepexec` output parameters.
+///
+/// SQL Server returns unnamed outputs in the declared positional order, while
+/// the self-hosted tests use names. Match names first, then positions.
+pub(crate) fn prepared_cursor_from_outputs(
+    outputs: &[OutputValue],
+) -> crate::Result<PreparedCursor> {
+    let lookup_named = |name: &str| -> Option<i32> {
+        outputs
+            .iter()
+            .find(|o| !o.name().is_empty() && o.matches_name(name))
+            .and_then(|o| o.get::<i32>().ok().flatten())
+    };
+    let by_pos = |idx: usize| -> Option<i32> {
+        outputs.get(idx).and_then(|o| o.get::<i32>().ok().flatten())
+    };
+
+    let prepared_handle = lookup_named("prepared_handle")
+        .or_else(|| lookup_named("handle"))
+        .or_else(|| by_pos(0))
+        .ok_or_else(|| {
+            crate::Error::Protocol(
+                "sp_cursorprepexec: missing @prepared_handle output parameter".into(),
+            )
+        })?;
+    if prepared_handle == 0 {
+        return Err(crate::Error::Protocol(
+            "sp_cursorprepexec: server returned a zero @prepared_handle".into(),
+        ));
+    }
+
+    let cursor_handle = lookup_named("cursor")
+        .or_else(|| by_pos(1))
+        .ok_or_else(|| {
+            crate::Error::Protocol("sp_cursorprepexec: missing @cursor output parameter".into())
+        })?;
+    if cursor_handle == 0 {
+        return Err(crate::Error::Protocol(
+            "sp_cursorprepexec: server returned a zero @cursor".into(),
+        ));
+    }
+
+    let scrollopt = lookup_named("scrollopt").or_else(|| by_pos(2)).unwrap_or(0);
+    let ccopt = lookup_named("ccopt").or_else(|| by_pos(3)).unwrap_or(0);
+    let row_count = lookup_named("rowcount").or_else(|| by_pos(4)).unwrap_or(-1);
+
+    let cursor = Cursor {
+        handle: CursorHandle(cursor_handle),
+        scrollopt: i32_to_scroll_flags(scrollopt),
+        ccopt: i32_to_cc_flags(ccopt),
+        row_count,
+        closed: false,
+    };
+
+    Ok(PreparedCursor {
+        prepared_handle: PreparedHandle::from_i32(prepared_handle),
+        cursor: Some(cursor),
+        cursor_handle: CursorHandle(cursor_handle),
+        scrollopt: i32_to_scroll_flags(scrollopt),
+        ccopt: i32_to_cc_flags(ccopt),
+        row_count,
+        released: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tds::codec::{BaseMetaDataColumn, FixedLenType, TokenReturnValue, TypeInfo};
 
     #[test]
     fn fetch_encodes_next() {
@@ -456,7 +693,11 @@ mod tests {
     #[test]
     fn fetch_encodes_relative_with_negative_offset() {
         assert_eq!(
-            Fetch::Relative { offset: -3, count: 1 }.encode(),
+            Fetch::Relative {
+                offset: -3,
+                count: 1
+            }
+            .encode(),
             (0x0020, -3, 1)
         );
     }
@@ -481,7 +722,9 @@ mod tests {
     fn default_options_are_forward_only_readonly() {
         let opts = CursorOpenOptions::default();
         assert!(opts.scroll().contains(CursorScrollOptions::ForwardOnly));
-        assert!(opts.concurrency().contains(CursorConcurrencyOptions::ReadOnly));
+        assert!(opts
+            .concurrency()
+            .contains(CursorConcurrencyOptions::ReadOnly));
     }
 
     #[test]
@@ -490,5 +733,99 @@ mod tests {
         // we don't want to panic on a server that sends proprietary bits.
         let flags = i32_to_scroll_flags(0x0004);
         assert!(flags.contains(CursorScrollOptions::ForwardOnly));
+    }
+
+    fn output(name: &str, value: i32) -> OutputValue {
+        TokenReturnValue {
+            param_ordinal: 0,
+            param_name: name.to_string(),
+            udf: false,
+            meta: BaseMetaDataColumn {
+                user_type: 0,
+                flags: BitFlags::empty(),
+                ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                table_name: None,
+            },
+            value: ColumnData::I32(Some(value)),
+        }
+        .into()
+    }
+
+    #[test]
+    fn cursorprepexec_params_match_trace_order_and_outputs() {
+        let p1: &dyn ToSql = &42i32;
+        let params = build_cursorprepexec_params(
+            Cow::Borrowed("SELECT @P1"),
+            CursorOpenOptions::default(),
+            Cow::Borrowed("@P1 int"),
+            &[p1],
+        );
+
+        assert_eq!(params.len(), 8);
+        assert!(params[0].flags.contains(RpcStatus::ByRefValue));
+        assert!(params[1].flags.contains(RpcStatus::ByRefValue));
+        assert!(matches!(params[2].value, ColumnData::String(Some(ref s)) if s == "@P1 int"));
+        assert!(matches!(params[3].value, ColumnData::String(Some(ref s)) if s == "SELECT @P1"));
+        assert!(params[4].flags.contains(RpcStatus::ByRefValue));
+        assert!(params[5].flags.contains(RpcStatus::ByRefValue));
+        assert!(params[6].flags.contains(RpcStatus::ByRefValue));
+        assert_eq!(params[7].name, "@P1");
+    }
+
+    #[test]
+    fn cursorprepexec_sends_empty_param_defs_slot() {
+        let params = build_cursorprepexec_params(
+            Cow::Borrowed("SELECT 1"),
+            CursorOpenOptions::default(),
+            Cow::Borrowed(""),
+            &[],
+        );
+        assert!(matches!(params[2].value, ColumnData::String(Some(ref s)) if s.is_empty()));
+    }
+
+    #[test]
+    fn prepared_cursor_parses_positional_outputs() {
+        let outputs = vec![
+            output("", 11),
+            output("", 22),
+            output("", CursorScrollOptions::ForwardOnly as i32),
+            output("", CursorConcurrencyOptions::ReadOnly as i32),
+            output("", 3),
+        ];
+
+        let pc = prepared_cursor_from_outputs(&outputs).unwrap();
+        assert_eq!(pc.prepared_handle().as_i32(), 11);
+        assert_eq!(pc.cursor_handle().as_i32(), 22);
+        assert!(pc
+            .scroll_options()
+            .contains(CursorScrollOptions::ForwardOnly));
+        assert!(pc
+            .concurrency_options()
+            .contains(CursorConcurrencyOptions::ReadOnly));
+        assert_eq!(pc.row_count(), 3);
+    }
+
+    #[test]
+    fn prepared_cursor_parses_named_outputs() {
+        let outputs = vec![
+            output("@cursor", 22),
+            output("@rowcount", 3),
+            output("@prepared_handle", 11),
+            output("@ccopt", CursorConcurrencyOptions::ReadOnly as i32),
+            output("@scrollopt", CursorScrollOptions::ForwardOnly as i32),
+        ];
+
+        let pc = prepared_cursor_from_outputs(&outputs).unwrap();
+        assert_eq!(pc.prepared_handle().as_i32(), 11);
+        assert_eq!(pc.cursor_handle().as_i32(), 22);
+        assert_eq!(pc.row_count(), 3);
+    }
+
+    #[test]
+    fn cursorunprepare_param_contains_prepared_handle() {
+        let param = build_cursorunprepare_param(PreparedHandle::from_i32(77));
+        assert_eq!(param.name, "");
+        assert!(param.flags.is_empty());
+        assert!(matches!(param.value, ColumnData::I32(Some(77))));
     }
 }

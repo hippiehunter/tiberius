@@ -20,6 +20,7 @@ pub use config::*;
 pub(crate) use connection::*;
 pub use cursor::{
     Cursor, CursorConcurrencyOptions, CursorHandle, CursorOpenOptions, CursorScrollOptions, Fetch,
+    PreparedCursor,
 };
 pub use prepared::{PreparedHandle, PreparedStatement};
 pub use rpc_response::OutputValue;
@@ -534,6 +535,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         cursor::cursor_from_outputs(&outputs)
     }
 
+    /// Prepare a statement and open a cursor over its first execution in one
+    /// round trip using `sp_cursorprepexec`.
+    ///
+    /// `param_defs` follows the same format as [`prepare`](Self::prepare);
+    /// pass an empty string when the statement has no parameters.
+    pub async fn cursor_prep_exec<'a>(
+        &mut self,
+        sql: impl Into<Cow<'a, str>>,
+        options: cursor::CursorOpenOptions,
+        param_defs: impl Into<Cow<'a, str>>,
+        params: &[&'a dyn ToSql],
+    ) -> crate::Result<PreparedCursor> {
+        self.connection.flush_stream().await?;
+        let rpc_params =
+            cursor::build_cursorprepexec_params(sql.into(), options, param_defs.into(), params);
+        self.send_rpc(RpcProcId::CursorPrepExec, rpc_params).await?;
+
+        let (outputs, _status) = rpc_response::collect_rpc_outputs(&mut self.connection).await?;
+        cursor::prepared_cursor_from_outputs(&outputs)
+    }
+
     /// Prepare and execute a SQL statement in a single round trip. Returns
     /// the handle alongside the buffered result rows from the first
     /// execution.
@@ -582,7 +604,6 @@ async fn collect_prep_exec_results<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    use crate::row::ColumnType;
     use crate::tds::codec::DoneStatus;
     use crate::{Column, Row};
     use std::sync::Arc;
@@ -604,14 +625,7 @@ where
                     results.push(std::mem::take(&mut current));
                     result_index += 1;
                 }
-                let column_meta = meta
-                    .columns
-                    .iter()
-                    .map(|x| Column {
-                        name: x.col_name.to_string(),
-                        column_type: ColumnType::from(&x.base.ty),
-                    })
-                    .collect::<Vec<_>>();
+                let column_meta = meta.columns().collect::<Vec<_>>();
                 columns = Some(Arc::new(column_meta));
             }
             ReceivedToken::Row(data) => {
