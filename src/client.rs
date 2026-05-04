@@ -604,7 +604,6 @@ async fn collect_prep_exec_results<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    use crate::row::ColumnType;
     use crate::tds::codec::DoneStatus;
     use crate::{Column, Row};
     use std::sync::Arc;
@@ -626,14 +625,7 @@ where
                     results.push(std::mem::take(&mut current));
                     result_index += 1;
                 }
-                let column_meta = meta
-                    .columns
-                    .iter()
-                    .map(|x| Column {
-                        name: x.col_name.to_string(),
-                        column_type: ColumnType::from(&x.base.ty),
-                    })
-                    .collect::<Vec<_>>();
+                let column_meta = meta.columns().collect::<Vec<_>>();
                 columns = Some(Arc::new(column_meta));
             }
             ReceivedToken::Row(data) => {

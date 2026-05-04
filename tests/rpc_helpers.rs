@@ -29,7 +29,7 @@ use tiberius::server::{
     TdsAuthHandler, TdsBackendMessage, TdsClient, TdsServerHandlers,
 };
 use tiberius::{
-    BaseMetaDataColumn, Client, ColumnData, Config, CursorOpenOptions, EncryptionLevel,
+    BaseMetaDataColumn, Client, ColumnData, ColumnFlag, Config, CursorOpenOptions, EncryptionLevel,
     FixedLenType, MetaDataColumn, RpcProcId, TokenDone, TypeInfo,
 };
 
@@ -195,7 +195,7 @@ fn int_int_column() -> MetaDataColumn<'static> {
     MetaDataColumn {
         base: BaseMetaDataColumn {
             user_type: 0,
-            flags: BitFlags::empty(),
+            flags: BitFlags::from(ColumnFlag::Nullable),
             ty: TypeInfo::FixedLen(FixedLenType::Int4),
             table_name: None,
         },
@@ -1008,15 +1008,29 @@ fn cursor_prep_exec_fetch_close_unprepare() {
             assert_ne!(cursor.cursor_handle().as_i32(), 0);
             assert_eq!(cursor.row_count(), 3);
 
-            let rows = cursor
+            let mut stream = cursor
                 .fetch(&mut client, tiberius::Fetch::Next { count: 142 })
                 .await
-                .unwrap()
-                .into_first_result()
-                .await
                 .unwrap();
+            let columns = stream.columns().await.unwrap().unwrap();
+            assert_eq!(columns[0].name(), "v");
+            assert_eq!(columns[0].ordinal(), Some(0));
+            assert_eq!(
+                columns[0].type_info(),
+                Some(&TypeInfo::FixedLen(FixedLenType::Int4))
+            );
+            assert_eq!(columns[0].fixed_len_type(), Some(FixedLenType::Int4));
+            assert!(columns[0].flags().contains(ColumnFlag::Nullable));
+            assert!(columns[0].is_nullable());
+
+            let rows = stream.into_first_result().await.unwrap();
             assert_eq!(rows.len(), 3);
             assert_eq!(rows[0].get::<i32, _>(0), Some(1));
+            assert_eq!(
+                rows[0].columns()[0].type_info(),
+                Some(&TypeInfo::FixedLen(FixedLenType::Int4))
+            );
+            assert!(rows[0].columns()[0].flags().contains(ColumnFlag::Nullable));
             assert_eq!(rows[1].get::<i32, _>(0), Some(2));
             assert_eq!(rows[2].get::<i32, _>(0), Some(3));
 
