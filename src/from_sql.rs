@@ -1,5 +1,5 @@
 use crate::{
-    tds::codec::{TvpData, VariantData},
+    tds::codec::{TvpData, UdtData, VariantData},
     tds::Numeric,
     xml::XmlData,
     ColumnData,
@@ -27,6 +27,7 @@ use uuid::Uuid;
 /// |[`Numeric`]|`numeric`/`decimal`|
 /// |[`Decimal`] (with feature flag `rust_decimal`)|`numeric`/`decimal`|
 /// |[`XmlData`]|`xml`|
+/// |[`UdtData`]|CLR user-defined type, including `hierarchyid`|
 /// |[`VariantData`]|`sql_variant`|
 /// |[`TvpData`]|table-valued parameter|
 /// |[`NaiveDateTime`] (with feature flag `chrono`)|`datetime`/`datetime2`/`smalldatetime`|
@@ -43,6 +44,7 @@ use uuid::Uuid;
 /// [`Numeric`]: numeric/struct.Numeric.html
 /// [`Decimal`]: numeric/struct.Decimal.html
 /// [`XmlData`]: xml/struct.XmlData.html
+/// [`UdtData`]: struct.UdtData.html
 /// [`NaiveDateTime`]: time/chrono/struct.NaiveDateTime.html
 /// [`NaiveDate`]: time/chrono/struct.NaiveDate.html
 /// [`NaiveTime`]: time/chrono/struct.NaiveTime.html
@@ -135,6 +137,30 @@ impl<'a> FromSql<'a> for &'a [u8] {
             ColumnData::Binary(b) => Ok(b.as_ref().map(|s| s.as_ref())),
             v => Err(crate::Error::Conversion(
                 format!("cannot interpret {:?} as a &[u8] value", v).into(),
+            )),
+        }
+    }
+}
+
+// -- UdtData: FromSql / FromSqlOwned --
+
+impl FromSqlOwned for UdtData<'static> {
+    fn from_sql_owned(value: ColumnData<'static>) -> crate::Result<Option<Self>> {
+        match value {
+            ColumnData::Udt(data) => Ok(data.map(UdtData::new)),
+            v => Err(crate::Error::Conversion(
+                format!("cannot interpret {:?} as a CLR UDT value", v).into(),
+            )),
+        }
+    }
+}
+
+impl<'a> FromSql<'a> for UdtData<'a> {
+    fn from_sql(value: &'a ColumnData<'static>) -> crate::Result<Option<Self>> {
+        match value {
+            ColumnData::Udt(data) => Ok(data.as_ref().map(|bytes| UdtData::new(bytes.as_ref()))),
+            v => Err(crate::Error::Conversion(
+                format!("cannot interpret {:?} as a CLR UDT value", v).into(),
             )),
         }
     }

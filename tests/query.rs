@@ -9,7 +9,7 @@ use std::sync::Once;
 use tiberius::FromSql;
 use tiberius::{
     numeric::Numeric, xml::XmlData, ColumnData, ColumnFlag, ColumnType, Query, QueryItem, Result,
-    TvpColumn, TvpData, TypeInfo, VarLenContext, VarLenType, VariantData,
+    TvpColumn, TvpData, TypeInfo, UdtData, VarLenContext, VarLenType, VariantData,
 };
 use uuid::Uuid;
 
@@ -3145,6 +3145,32 @@ where
 
     let (_, inner) = read_back.unwrap().decode_typed().await?;
     assert_eq!(inner, ColumnData::I32(Some(99)));
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn hierarchyid_read_as_raw_clr_data<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let row = conn
+        .query("SELECT CAST('/1/2/' AS hierarchyid) AS hid", &[])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+
+    let hid: Option<UdtData<'_>> = row.get("hid");
+    assert!(hid.is_some());
+    assert!(!hid.unwrap().as_bytes().is_empty());
+
+    let column = &row.columns()[0];
+    assert!(column.is_udt());
+
+    let info = column.udt_info().unwrap();
+    assert_eq!(info.type_name, "hierarchyid");
+    assert!(info.assembly_name.contains("SqlHierarchyId"));
 
     Ok(())
 }
