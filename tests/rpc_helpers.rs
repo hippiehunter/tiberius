@@ -496,7 +496,25 @@ impl SpCursorFetchHandler for TestCursorFetch {
                 store.get(&request.handle).cloned().unwrap_or_default()
             };
 
-            if request.n_rows == 0 {
+            if request.fetch_type == 0x0002 && request.row_num == 0 && request.n_rows == 1424 {
+                client
+                    .send(TdsBackendMessage::TokenPartial(BackendToken::ColMetaData(
+                        TokenColMetaData {
+                            columns: vec![int_int_column()],
+                        },
+                    )))
+                    .await?;
+                let mut writer = ResultSetWriter::start(client, vec![int_int_column()]).await?;
+                for v in &rows {
+                    writer.send_row_iter([ColumnData::I32(Some(*v))]).await?;
+                }
+                writer
+                    .into_client()
+                    .send(TdsBackendMessage::TokenPartial(BackendToken::DoneInProc(
+                        TokenDone::with_rows(rows.len() as u64),
+                    )))
+                    .await?;
+            } else if request.n_rows == 0 {
                 client
                     .send(TdsBackendMessage::TokenPartial(BackendToken::ColMetaData(
                         TokenColMetaData {
@@ -515,11 +533,7 @@ impl SpCursorFetchHandler for TestCursorFetch {
             send_return_status(client, 0).await?;
             client
                 .send(TdsBackendMessage::Token(BackendToken::DoneProc(
-                    TokenDone::with_rows(if request.n_rows == 0 {
-                        0
-                    } else {
-                        rows.len() as u64
-                    }),
+                    TokenDone::with_rows(rows.len() as u64),
                 )))
                 .await?;
             Ok(())
@@ -1114,7 +1128,7 @@ fn cursor_prep_exec_fetch_metadata_close_unprepare() {
             assert!(columns[0].flags().contains(ColumnFlag::Nullable));
 
             let seen_fetches = state.cursor_fetch_log.lock().unwrap().clone();
-            assert_eq!(seen_fetches, vec![(0x0002, 0, 0)]);
+            assert_eq!(seen_fetches, vec![(0x0002, 0, 1424)]);
 
             let param_defs = state.cursorprepexec_param_defs_log.lock().unwrap().clone();
             assert_eq!(param_defs, vec!["".to_string()]);

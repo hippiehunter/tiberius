@@ -274,9 +274,10 @@ impl PreparedCursor {
 
     /// Fetch only result-set metadata for this cursor without consuming rows.
     ///
-    /// This probes the server with `sp_cursorfetch @fetchtype = Next`,
-    /// `@rownum = 0`, and `@nrows = 0`, then drains the RPC response while
-    /// treating any returned row token as a protocol error.
+    /// This probes the server with the legacy-compatible
+    /// `sp_cursorfetch @fetchtype = Next`, `@rownum = 0`, and `@nrows = 1424`
+    /// shape, captures the first non-empty `COLMETADATA`, then cleans the
+    /// response without exposing fetched rows.
     pub async fn fetch_metadata<S>(&self, client: &mut Client<S>) -> crate::Result<Vec<Column>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -286,7 +287,7 @@ impl PreparedCursor {
         })?;
 
         client.connection.flush_stream().await?;
-        let rpc_params = build_cursorfetch_params(cursor.handle, Fetch::Next { count: 0 });
+        let rpc_params = build_cursorfetch_params(cursor.handle, Fetch::Next { count: 1424 });
         client.send_rpc(RpcProcId::CursorFetch, rpc_params).await?;
         collect_metadata_only_rpc(&mut client.connection).await
     }
@@ -735,7 +736,7 @@ mod tests {
 
     #[test]
     fn cursorfetch_params_encode_metadata_probe() {
-        let params = build_cursorfetch_params(CursorHandle(1234), Fetch::Next { count: 0 });
+        let params = build_cursorfetch_params(CursorHandle(1234), Fetch::Next { count: 1424 });
         let values: Vec<_> = params
             .iter()
             .map(|p| match &p.value {
@@ -744,7 +745,7 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(values, vec![1234, 0x0002, 0, 0]);
+        assert_eq!(values, vec![1234, 0x0002, 0, 1424]);
     }
 
     #[test]

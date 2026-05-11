@@ -17,6 +17,7 @@ use crate::{Column, FromSql, SqlReadBytes, TokenType};
 use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::{Stream, TryStreamExt};
 use std::convert::TryFrom;
+use std::sync::Arc;
 
 /// A single `RETURNVALUE` token surfaced to the client.
 ///
@@ -152,16 +153,17 @@ where
 }
 
 /// Drain a metadata-only cursor-fetch RPC response without constructing a
-/// [`TokenStream`]. `TokenStream` eagerly decodes ROW/NBCROW tokens; metadata
-/// probing deliberately avoids that path because `sp_cursorfetch` with
-/// `nrows = 0` should not contain row payloads.
+/// [`QueryStream`](crate::QueryStream). The legacy-compatible metadata probe
+/// uses a non-zero fetch count, so the response may contain ROW/NBCROW tokens
+/// after COLMETADATA. This walker returns as soon as it sees the first
+/// non-empty COLMETADATA and then asks the connection to clean the rest of the
+/// response.
 pub(crate) async fn collect_metadata_only_rpc<S>(
     conn: &mut Connection<S>,
 ) -> crate::Result<Vec<Column>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let mut columns = None;
     let mut last_error = None;
 
     loop {
@@ -173,7 +175,12 @@ where
         match ty {
             TokenType::ColMetaData => {
                 let metadata = TokenColMetaData::decode(conn).await?;
-                columns = Some(metadata.columns().collect());
+                if !metadata.columns.is_empty() {
+                    let columns = metadata.columns().collect();
+                    conn.context_mut().set_last_meta(Arc::new(metadata));
+                    conn.flush_stream().await?;
+                    return Ok(columns);
+                }
             }
             TokenType::ReturnStatus => {
                 let _ = conn.read_u32_le().await?;
@@ -219,7 +226,7 @@ where
             }
             TokenType::Row | TokenType::NbcRow => {
                 return Err(crate::Error::Protocol(
-                    "metadata-only cursor fetch returned row data".into(),
+                    "metadata cursor fetch returned row data before non-empty COLMETADATA".into(),
                 ));
             }
             other => {
@@ -238,9 +245,9 @@ where
         return Err(err);
     }
 
-    columns.ok_or_else(|| {
-        crate::Error::Protocol("metadata-only cursor fetch returned no COLMETADATA".into())
-    })
+    Err(crate::Error::Protocol(
+        "metadata cursor fetch returned no non-empty COLMETADATA".into(),
+    ))
 }
 
 #[cfg(test)]
