@@ -1672,6 +1672,12 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     dst[len_pos + i] = *byte;
                 }
             }
+            (ColumnData::String(None), None) => {
+                dst.put_u8(VarLenType::NVarchar as u8);
+                dst.put_u16_le(8000);
+                dst.extend_from_slice(&[0u8; 5][..]);
+                dst.put_u16_le(0xffff);
+            }
             (ColumnData::String(Some(ref s)), None) => {
                 // length: 0xffff and raw collation
                 dst.put_u8(VarLenType::NVarchar as u8);

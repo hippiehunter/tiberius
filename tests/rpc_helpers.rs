@@ -139,7 +139,8 @@ struct SharedState {
     /// observed. Tests assert on this to prove the client's wire encoding
     /// of (fetch_type, row_num, n_rows) actually reaches the server.
     cursor_fetch_log: Mutex<Vec<(i32, i32, i32)>>,
-    cursorprepexec_param_defs_log: Mutex<Vec<String>>,
+    cursorprepexec_param_defs_log: Mutex<Vec<Option<String>>>,
+    cursorprepexec_send_metadata: Mutex<bool>,
     rpc_log: Mutex<Vec<RpcProcId>>,
 }
 
@@ -151,6 +152,7 @@ impl SharedState {
             cursor_rows: Mutex::new(HashMap::new()),
             cursor_fetch_log: Mutex::new(Vec::new()),
             cursorprepexec_param_defs_log: Mutex::new(Vec::new()),
+            cursorprepexec_send_metadata: Mutex::new(false),
             rpc_log: Mutex::new(Vec::new()),
         }
     }
@@ -497,23 +499,33 @@ impl SpCursorFetchHandler for TestCursorFetch {
             };
 
             if request.fetch_type == 0x0002 && request.row_num == 0 && request.n_rows == 1424 {
-                client
-                    .send(TdsBackendMessage::TokenPartial(BackendToken::ColMetaData(
-                        TokenColMetaData {
-                            columns: vec![int_int_column()],
-                        },
-                    )))
-                    .await?;
-                let mut writer = ResultSetWriter::start(client, vec![int_int_column()]).await?;
-                for v in &rows {
-                    writer.send_row_iter([ColumnData::I32(Some(*v))]).await?;
+                let prepexec_sent_metadata =
+                    *self.0.cursorprepexec_send_metadata.lock().unwrap();
+                if prepexec_sent_metadata {
+                    client
+                        .send(TdsBackendMessage::TokenPartial(BackendToken::DoneInProc(
+                            TokenDone::with_rows(0),
+                        )))
+                        .await?;
+                } else {
+                    client
+                        .send(TdsBackendMessage::TokenPartial(BackendToken::ColMetaData(
+                            TokenColMetaData {
+                                columns: vec![int_int_column()],
+                            },
+                        )))
+                        .await?;
+                    let mut writer = ResultSetWriter::start(client, vec![int_int_column()]).await?;
+                    for v in &rows {
+                        writer.send_row_iter([ColumnData::I32(Some(*v))]).await?;
+                    }
+                    writer
+                        .into_client()
+                        .send(TdsBackendMessage::TokenPartial(BackendToken::DoneInProc(
+                            TokenDone::with_rows(rows.len() as u64),
+                        )))
+                        .await?;
                 }
-                writer
-                    .into_client()
-                    .send(TdsBackendMessage::TokenPartial(BackendToken::DoneInProc(
-                        TokenDone::with_rows(rows.len() as u64),
-                    )))
-                    .await?;
             } else if request.n_rows == 0 {
                 client
                     .send(TdsBackendMessage::TokenPartial(BackendToken::ColMetaData(
@@ -639,7 +651,14 @@ impl RpcHandler for SpecialRpc {
                                 .cursorprepexec_param_defs_log
                                 .lock()
                                 .unwrap()
-                                .push(s.to_string());
+                                .push(Some(s.to_string()));
+                        }
+                        ColumnData::String(None) => {
+                            self.0
+                                .cursorprepexec_param_defs_log
+                                .lock()
+                                .unwrap()
+                                .push(None);
                         }
                         other => panic!("sp_cursorprepexec @params was not a string: {:?}", other),
                     }
@@ -677,6 +696,22 @@ impl RpcHandler for SpecialRpc {
                         .lock()
                         .unwrap()
                         .insert(cursor_handle, rows.clone());
+
+                    let send_metadata = *self.0.cursorprepexec_send_metadata.lock().unwrap();
+                    if send_metadata {
+                        client
+                            .send(TdsBackendMessage::TokenPartial(BackendToken::ColMetaData(
+                                TokenColMetaData {
+                                    columns: vec![int_int_column()],
+                                },
+                            )))
+                            .await?;
+                        client
+                            .send(TdsBackendMessage::TokenPartial(BackendToken::DoneInProc(
+                                TokenDone::with_rows(0),
+                            )))
+                            .await?;
+                    }
 
                     let outputs = vec![
                         OutputParameter::from_input(
@@ -1131,7 +1166,7 @@ fn cursor_prep_exec_fetch_metadata_close_unprepare() {
             assert_eq!(seen_fetches, vec![(0x0002, 0, 1424)]);
 
             let param_defs = state.cursorprepexec_param_defs_log.lock().unwrap().clone();
-            assert_eq!(param_defs, vec!["".to_string()]);
+            assert_eq!(param_defs, vec![None]);
 
             cursor.close_cursor(&mut client).await.unwrap();
             cursor.unprepare(&mut client).await.unwrap();
@@ -1142,6 +1177,56 @@ fn cursor_prep_exec_fetch_metadata_close_unprepare() {
                 vec![
                     RpcProcId::CursorPrepExec,
                     RpcProcId::CursorFetch,
+                    RpcProcId::CursorClose,
+                    RpcProcId::CursorUnprepare,
+                ]
+            );
+        })
+        .await;
+    });
+}
+
+#[test]
+fn cursor_prep_exec_fetch_metadata_reuses_initial_metadata() {
+    smol::block_on(async {
+        with_server(|addr, state| async move {
+            *state.cursorprepexec_send_metadata.lock().unwrap() = true;
+            let mut client = connect_client(addr).await.unwrap();
+
+            let mut cursor = client
+                .cursor_prep_exec(
+                    "SELECT 1 AS v UNION ALL SELECT 2 AS v UNION ALL SELECT 3 AS v",
+                    CursorOpenOptions::default(),
+                    "",
+                    &[],
+                )
+                .await
+                .unwrap();
+
+            let columns = cursor.fetch_metadata(&mut client).await.unwrap();
+            assert_eq!(columns.len(), 1);
+            assert_eq!(columns[0].name(), "v");
+            assert_eq!(columns[0].ordinal(), Some(0));
+            assert_eq!(
+                columns[0].type_info(),
+                Some(&TypeInfo::FixedLen(FixedLenType::Int4))
+            );
+            assert!(columns[0].flags().contains(ColumnFlag::Nullable));
+
+            let seen_fetches = state.cursor_fetch_log.lock().unwrap().clone();
+            assert!(seen_fetches.is_empty());
+
+            let param_defs = state.cursorprepexec_param_defs_log.lock().unwrap().clone();
+            assert_eq!(param_defs, vec![None]);
+
+            cursor.close_cursor(&mut client).await.unwrap();
+            cursor.unprepare(&mut client).await.unwrap();
+
+            let seen_rpcs = state.rpc_log.lock().unwrap().clone();
+            assert_eq!(
+                seen_rpcs,
+                vec![
+                    RpcProcId::CursorPrepExec,
                     RpcProcId::CursorClose,
                     RpcProcId::CursorUnprepare,
                 ]

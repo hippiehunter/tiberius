@@ -105,25 +105,55 @@ pub(crate) async fn collect_rpc_outputs<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let (outputs, status, _) = collect_rpc_outputs_with_metadata(conn).await?;
+    Ok((outputs, status))
+}
+
+pub(crate) async fn collect_rpc_outputs_with_metadata<S>(
+    conn: &mut Connection<S>,
+) -> crate::Result<(Vec<OutputValue>, Option<u32>, Option<Vec<Column>>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let ts = TokenStream::new(conn);
     let stream = ts.try_unfold();
-    collect_rpc_outputs_from_stream(stream).await
+    collect_rpc_outputs_with_metadata_from_stream(stream).await
 }
 
 /// Lower-level variant that drains an arbitrary token stream. Exists to
 /// make `collect_rpc_outputs` unit-testable with synthetic inputs.
+#[cfg(test)]
 pub(crate) async fn collect_rpc_outputs_from_stream<S>(
-    mut stream: S,
+    stream: S,
 ) -> crate::Result<(Vec<OutputValue>, Option<u32>)>
+where
+    S: Stream<Item = crate::Result<ReceivedToken>> + Unpin,
+{
+    let (outputs, status, _) = collect_rpc_outputs_with_metadata_from_stream(stream).await?;
+    Ok((outputs, status))
+}
+
+async fn collect_rpc_outputs_with_metadata_from_stream<S>(
+    mut stream: S,
+) -> crate::Result<(Vec<OutputValue>, Option<u32>, Option<Vec<Column>>)>
 where
     S: Stream<Item = crate::Result<ReceivedToken>> + Unpin,
 {
     let mut outputs = Vec::new();
     let mut status = None;
+    let mut metadata = None;
     let mut last_error: Option<crate::Error> = None;
 
     while let Some(token) = stream.try_next().await? {
         match token {
+            ReceivedToken::NewResultset(meta) => {
+                if metadata.is_none() {
+                    let columns = meta.columns().collect::<Vec<_>>();
+                    if !columns.is_empty() {
+                        metadata = Some(columns);
+                    }
+                }
+            }
             ReceivedToken::ReturnValue(rv) => outputs.push(rv.into()),
             ReceivedToken::ReturnStatus(s) => status = Some(s),
             ReceivedToken::Error(e) => {
@@ -149,7 +179,7 @@ where
         return Err(err);
     }
 
-    Ok((outputs, status))
+    Ok((outputs, status, metadata))
 }
 
 /// Drain a metadata-only cursor-fetch RPC response without constructing a
@@ -253,7 +283,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tds::codec::{BaseMetaDataColumn, FixedLenType, TokenDone, TokenError, TypeInfo};
+    use crate::tds::codec::{
+        BaseMetaDataColumn, FixedLenType, MetaDataColumn, TokenDone, TokenError, TypeInfo,
+    };
     use enumflags2::BitFlags;
     use futures_util::stream::iter;
 
@@ -267,6 +299,20 @@ mod tests {
 
     fn synthetic(tokens: Vec<ReceivedToken>) -> impl Stream<Item = crate::Result<ReceivedToken>> {
         iter(tokens.into_iter().map(Ok))
+    }
+
+    fn mk_metadata(name: &'static str) -> Arc<TokenColMetaData<'static>> {
+        Arc::new(TokenColMetaData {
+            columns: vec![MetaDataColumn {
+                base: BaseMetaDataColumn {
+                    user_type: 0,
+                    flags: BitFlags::empty(),
+                    ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                    table_name: None,
+                },
+                col_name: std::borrow::Cow::Borrowed(name),
+            }],
+        })
     }
 
     fn mk_return_value(name: &str, ordinal: u16, value: ColumnData<'static>) -> TokenReturnValue {
@@ -353,6 +399,33 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].get::<i32>().unwrap(), Some(42));
         assert_eq!(status, Some(0));
+    }
+
+    #[tokio::test]
+    async fn collect_captures_first_non_empty_metadata() {
+        let s = synthetic(vec![
+            ReceivedToken::NewResultset(Arc::new(TokenColMetaData {
+                columns: Vec::new(),
+            })),
+            ReceivedToken::NewResultset(mk_metadata("v")),
+            ReceivedToken::ReturnValue(mk_return_value("@handle", 1, ColumnData::I32(Some(42)))),
+            ReceivedToken::ReturnStatus(0),
+            mk_done_proc_final(),
+        ]);
+
+        let (outputs, status, metadata) =
+            collect_rpc_outputs_with_metadata_from_stream(s).await.unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].get::<i32>().unwrap(), Some(42));
+        assert_eq!(status, Some(0));
+        let metadata = metadata.unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].name(), "v");
+        assert_eq!(
+            metadata[0].type_info(),
+            Some(&TypeInfo::FixedLen(FixedLenType::Int4))
+        );
     }
 
     #[tokio::test]

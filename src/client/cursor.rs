@@ -228,6 +228,7 @@ pub struct PreparedCursor {
     scrollopt: BitFlags<CursorScrollOptions>,
     ccopt: BitFlags<CursorConcurrencyOptions>,
     row_count: i32,
+    metadata: Option<Vec<Column>>,
     released: bool,
 }
 
@@ -285,6 +286,10 @@ impl PreparedCursor {
         let cursor = self.cursor.as_ref().ok_or_else(|| {
             crate::Error::Protocol("prepared cursor: cursor is already closed".into())
         })?;
+
+        if let Some(metadata) = &self.metadata {
+            return Ok(metadata.clone());
+        }
 
         client.connection.flush_stream().await?;
         let rpc_params = build_cursorfetch_params(cursor.handle, Fetch::Next { count: 1424 });
@@ -555,10 +560,15 @@ pub(crate) fn build_cursorprepexec_params<'a>(
         flags: RpcStatus::ByRefValue.into(),
         value: ColumnData::I32(Some(0)),
     });
+    let param_defs = if param_defs.is_empty() {
+        None
+    } else {
+        Some(param_defs)
+    };
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
         flags: BitFlags::empty(),
-        value: ColumnData::String(Some(param_defs)),
+        value: ColumnData::String(param_defs),
     });
     rpc_params.push(RpcParam {
         name: Cow::Borrowed(""),
@@ -640,6 +650,7 @@ pub(crate) fn cursor_from_outputs(outputs: &[OutputValue]) -> crate::Result<Curs
 /// the self-hosted tests use names. Match names first, then positions.
 pub(crate) fn prepared_cursor_from_outputs(
     outputs: &[OutputValue],
+    metadata: Option<Vec<Column>>,
 ) -> crate::Result<PreparedCursor> {
     let lookup_named = |name: &str| -> Option<i32> {
         outputs
@@ -695,6 +706,7 @@ pub(crate) fn prepared_cursor_from_outputs(
         scrollopt: i32_to_scroll_flags(scrollopt),
         ccopt: i32_to_cc_flags(ccopt),
         row_count,
+        metadata,
         released: false,
     })
 }
@@ -814,14 +826,14 @@ mod tests {
     }
 
     #[test]
-    fn cursorprepexec_sends_empty_param_defs_slot() {
+    fn cursorprepexec_sends_null_param_defs_slot() {
         let params = build_cursorprepexec_params(
             Cow::Borrowed("SELECT 1"),
             CursorOpenOptions::default(),
             Cow::Borrowed(""),
             &[],
         );
-        assert!(matches!(params[2].value, ColumnData::String(Some(ref s)) if s.is_empty()));
+        assert!(matches!(params[2].value, ColumnData::String(None)));
     }
 
     #[test]
@@ -834,7 +846,7 @@ mod tests {
             output("", 3),
         ];
 
-        let pc = prepared_cursor_from_outputs(&outputs).unwrap();
+        let pc = prepared_cursor_from_outputs(&outputs, None).unwrap();
         assert_eq!(pc.prepared_handle().as_i32(), 11);
         assert_eq!(pc.cursor_handle().as_i32(), 22);
         assert!(pc
@@ -856,10 +868,28 @@ mod tests {
             output("@scrollopt", CursorScrollOptions::ForwardOnly as i32),
         ];
 
-        let pc = prepared_cursor_from_outputs(&outputs).unwrap();
+        let pc = prepared_cursor_from_outputs(&outputs, None).unwrap();
         assert_eq!(pc.prepared_handle().as_i32(), 11);
         assert_eq!(pc.cursor_handle().as_i32(), 22);
         assert_eq!(pc.row_count(), 3);
+    }
+
+    #[test]
+    fn prepared_cursor_keeps_initial_metadata() {
+        let outputs = vec![
+            output("", 11),
+            output("", 22),
+            output("", CursorScrollOptions::ForwardOnly as i32),
+            output("", CursorConcurrencyOptions::ReadOnly as i32),
+            output("", 3),
+        ];
+        let metadata = vec![Column::new("v".to_string(), crate::ColumnType::Int4)];
+
+        let pc = prepared_cursor_from_outputs(&outputs, Some(metadata)).unwrap();
+
+        let metadata = pc.metadata.as_ref().unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].name(), "v");
     }
 
     #[test]
