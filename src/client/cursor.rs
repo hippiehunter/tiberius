@@ -275,10 +275,9 @@ impl PreparedCursor {
 
     /// Fetch only result-set metadata for this cursor without consuming rows.
     ///
-    /// This probes the server with the legacy-compatible
-    /// `sp_cursorfetch @fetchtype = Next`, `@rownum = 0`, and `@nrows = 0`
-    /// shape, captures the first non-empty `COLMETADATA`, then cleans the
-    /// response without exposing fetched rows.
+    /// This probes the server with
+    /// `sp_cursorfetch @fetchtype = Next`, `@rownum = 0`, and `@nrows = 0`,
+    /// then captures the first non-empty `COLMETADATA`.
     pub async fn fetch_metadata<S>(&self, client: &mut Client<S>) -> crate::Result<Vec<Column>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -748,7 +747,7 @@ mod tests {
 
     #[test]
     fn cursorfetch_params_encode_metadata_probe() {
-        let params = build_cursorfetch_params(CursorHandle(1234), Fetch::Next { count: 1424 });
+        let params = build_cursorfetch_params(CursorHandle(1234), Fetch::Next { count: 0 });
         let values: Vec<_> = params
             .iter()
             .map(|p| match &p.value {
@@ -757,7 +756,7 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(values, vec![1234, 0x0002, 0, 1424]);
+        assert_eq!(values, vec![1234, 0x0002, 0, 0]);
     }
 
     #[test]

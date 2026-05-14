@@ -183,11 +183,9 @@ where
 }
 
 /// Drain a metadata-only cursor-fetch RPC response without constructing a
-/// [`QueryStream`](crate::QueryStream). The legacy-compatible metadata probe
-/// uses a non-zero fetch count, so the response may contain ROW/NBCROW tokens
-/// after COLMETADATA. This walker returns as soon as it sees the first
-/// non-empty COLMETADATA and then asks the connection to clean the rest of the
-/// response.
+/// [`QueryStream`](crate::QueryStream). The metadata probe requests zero rows,
+/// so this walker returns as soon as it sees the first non-empty COLMETADATA
+/// and then asks the connection to clean the rest of the response.
 pub(crate) async fn collect_metadata_only_rpc<S>(
     conn: &mut Connection<S>,
 ) -> crate::Result<Vec<Column>>
