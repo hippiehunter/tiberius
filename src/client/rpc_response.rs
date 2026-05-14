@@ -7,11 +7,17 @@
 //! every new helper.
 
 use crate::client::Connection;
-use crate::tds::codec::{ColumnData, DoneStatus, TokenReturnValue};
+use crate::tds::codec::{
+    ColumnData, DoneStatus, TokenColInfo, TokenColMetaData, TokenColName, TokenDone,
+    TokenEnvChange, TokenError, TokenInfo, TokenOrder, TokenReturnValue, TokenSessionState,
+    TokenTabName,
+};
 use crate::tds::stream::{ReceivedToken, TokenStream};
-use crate::FromSql;
+use crate::{Column, FromSql, SqlReadBytes, TokenType};
 use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::{Stream, TryStreamExt};
+use std::convert::TryFrom;
+use std::sync::Arc;
 
 /// A single `RETURNVALUE` token surfaced to the client.
 ///
@@ -99,25 +105,55 @@ pub(crate) async fn collect_rpc_outputs<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let (outputs, status, _) = collect_rpc_outputs_with_metadata(conn).await?;
+    Ok((outputs, status))
+}
+
+pub(crate) async fn collect_rpc_outputs_with_metadata<S>(
+    conn: &mut Connection<S>,
+) -> crate::Result<(Vec<OutputValue>, Option<u32>, Option<Vec<Column>>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let ts = TokenStream::new(conn);
     let stream = ts.try_unfold();
-    collect_rpc_outputs_from_stream(stream).await
+    collect_rpc_outputs_with_metadata_from_stream(stream).await
 }
 
 /// Lower-level variant that drains an arbitrary token stream. Exists to
 /// make `collect_rpc_outputs` unit-testable with synthetic inputs.
+#[cfg(test)]
 pub(crate) async fn collect_rpc_outputs_from_stream<S>(
-    mut stream: S,
+    stream: S,
 ) -> crate::Result<(Vec<OutputValue>, Option<u32>)>
+where
+    S: Stream<Item = crate::Result<ReceivedToken>> + Unpin,
+{
+    let (outputs, status, _) = collect_rpc_outputs_with_metadata_from_stream(stream).await?;
+    Ok((outputs, status))
+}
+
+async fn collect_rpc_outputs_with_metadata_from_stream<S>(
+    mut stream: S,
+) -> crate::Result<(Vec<OutputValue>, Option<u32>, Option<Vec<Column>>)>
 where
     S: Stream<Item = crate::Result<ReceivedToken>> + Unpin,
 {
     let mut outputs = Vec::new();
     let mut status = None;
+    let mut metadata = None;
     let mut last_error: Option<crate::Error> = None;
 
     while let Some(token) = stream.try_next().await? {
         match token {
+            ReceivedToken::NewResultset(meta) => {
+                if metadata.is_none() {
+                    let columns = meta.columns().collect::<Vec<_>>();
+                    if !columns.is_empty() {
+                        metadata = Some(columns);
+                    }
+                }
+            }
             ReceivedToken::ReturnValue(rv) => outputs.push(rv.into()),
             ReceivedToken::ReturnStatus(s) => status = Some(s),
             ReceivedToken::Error(e) => {
@@ -143,13 +179,111 @@ where
         return Err(err);
     }
 
-    Ok((outputs, status))
+    Ok((outputs, status, metadata))
+}
+
+/// Drain a metadata-only cursor-fetch RPC response without constructing a
+/// [`QueryStream`](crate::QueryStream). The metadata probe requests zero rows,
+/// so this walker returns as soon as it sees the first non-empty COLMETADATA
+/// and then asks the connection to clean the rest of the response.
+pub(crate) async fn collect_metadata_only_rpc<S>(
+    conn: &mut Connection<S>,
+) -> crate::Result<Vec<Column>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let mut last_error = None;
+
+    loop {
+        let ty_byte = conn.read_u8().await?;
+        let ty = TokenType::try_from(ty_byte).map_err(|_| {
+            crate::Error::Protocol(format!("invalid token type {:x}", ty_byte).into())
+        })?;
+
+        match ty {
+            TokenType::ColMetaData => {
+                let metadata = TokenColMetaData::decode(conn).await?;
+                if !metadata.columns.is_empty() {
+                    let columns = metadata.columns().collect();
+                    conn.context_mut().set_last_meta(Arc::new(metadata));
+                    conn.flush_stream().await?;
+                    return Ok(columns);
+                }
+            }
+            TokenType::ReturnStatus => {
+                let _ = conn.read_u32_le().await?;
+            }
+            TokenType::ReturnValue => {
+                let _ = TokenReturnValue::decode(conn).await?;
+            }
+            TokenType::DoneInProc => {
+                let _ = TokenDone::decode(conn).await?;
+            }
+            TokenType::DoneProc | TokenType::Done => {
+                let done = TokenDone::decode(conn).await?;
+                if !done.status().contains(DoneStatus::More) {
+                    break;
+                }
+            }
+            TokenType::Error => {
+                let err = TokenError::decode(conn).await?;
+                if last_error.is_none() {
+                    last_error = Some(crate::Error::Server(err));
+                }
+            }
+            TokenType::Info => {
+                let _ = TokenInfo::decode(conn).await?;
+            }
+            TokenType::Order => {
+                let _ = TokenOrder::decode(conn).await?;
+            }
+            TokenType::ColName => {
+                let _ = TokenColName::decode(conn).await?;
+            }
+            TokenType::ColInfo => {
+                let _ = TokenColInfo::decode(conn).await?;
+            }
+            TokenType::TabName => {
+                let _ = TokenTabName::decode(conn).await?;
+            }
+            TokenType::EnvChange => {
+                let _ = TokenEnvChange::decode(conn).await?;
+            }
+            TokenType::SessionState => {
+                let _ = TokenSessionState::decode(conn).await?;
+            }
+            TokenType::Row | TokenType::NbcRow => {
+                return Err(crate::Error::Protocol(
+                    "metadata cursor fetch returned row data before non-empty COLMETADATA".into(),
+                ));
+            }
+            other => {
+                return Err(crate::Error::Protocol(
+                    format!(
+                        "metadata-only cursor fetch returned unexpected token {:?}",
+                        other
+                    )
+                    .into(),
+                ));
+            }
+        }
+    }
+
+    if let Some(err) = last_error {
+        return Err(err);
+    }
+
+    Err(crate::Error::Protocol(
+        "metadata cursor fetch returned no non-empty COLMETADATA".into(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tds::codec::{BaseMetaDataColumn, FixedLenType, TokenDone, TokenError, TypeInfo};
+    use crate::tds::codec::{
+        BaseMetaDataColumn, FixedLenType, MetaDataColumn, TokenDone, TokenError, TypeInfo,
+    };
     use enumflags2::BitFlags;
     use futures_util::stream::iter;
 
@@ -163,6 +297,20 @@ mod tests {
 
     fn synthetic(tokens: Vec<ReceivedToken>) -> impl Stream<Item = crate::Result<ReceivedToken>> {
         iter(tokens.into_iter().map(Ok))
+    }
+
+    fn mk_metadata(name: &'static str) -> Arc<TokenColMetaData<'static>> {
+        Arc::new(TokenColMetaData {
+            columns: vec![MetaDataColumn {
+                base: BaseMetaDataColumn {
+                    user_type: 0,
+                    flags: BitFlags::empty(),
+                    ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                    table_name: None,
+                },
+                col_name: std::borrow::Cow::Borrowed(name),
+            }],
+        })
     }
 
     fn mk_return_value(name: &str, ordinal: u16, value: ColumnData<'static>) -> TokenReturnValue {
@@ -249,6 +397,33 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].get::<i32>().unwrap(), Some(42));
         assert_eq!(status, Some(0));
+    }
+
+    #[tokio::test]
+    async fn collect_captures_first_non_empty_metadata() {
+        let s = synthetic(vec![
+            ReceivedToken::NewResultset(Arc::new(TokenColMetaData {
+                columns: Vec::new(),
+            })),
+            ReceivedToken::NewResultset(mk_metadata("v")),
+            ReceivedToken::ReturnValue(mk_return_value("@handle", 1, ColumnData::I32(Some(42)))),
+            ReceivedToken::ReturnStatus(0),
+            mk_done_proc_final(),
+        ]);
+
+        let (outputs, status, metadata) =
+            collect_rpc_outputs_with_metadata_from_stream(s).await.unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].get::<i32>().unwrap(), Some(42));
+        assert_eq!(status, Some(0));
+        let metadata = metadata.unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].name(), "v");
+        assert_eq!(
+            metadata[0].type_info(),
+            Some(&TypeInfo::FixedLen(FixedLenType::Int4))
+        );
     }
 
     #[tokio::test]

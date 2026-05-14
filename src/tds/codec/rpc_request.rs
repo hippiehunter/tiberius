@@ -56,9 +56,11 @@ pub struct RpcParam<'a> {
 /// 2.2.6.6 RPC Request
 #[allow(dead_code)]
 #[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RpcProcId {
     CursorOpen = 2,
+    CursorPrepExec = 5,
+    CursorUnprepare = 6,
     CursorFetch = 7,
     CursorClose = 9,
     ExecuteSQL = 10,

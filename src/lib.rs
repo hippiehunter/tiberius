@@ -271,7 +271,8 @@ pub mod server;
 
 pub use client::{
     AuthMethod, CancellationToken, Client, Config, Cursor, CursorConcurrencyOptions, CursorHandle,
-    CursorOpenOptions, CursorScrollOptions, Fetch, OutputValue, PreparedHandle, PreparedStatement,
+    CursorOpenOptions, CursorScrollOptions, Fetch, OutputValue, PreparedCursor, PreparedHandle,
+    PreparedStatement,
 };
 pub(crate) use error::Error;
 pub use from_sql::{FromSql, FromSqlOwned};
@@ -287,8 +288,8 @@ pub use tds::{
         TokenAltMetaData, TokenAltRow, TokenColInfo, TokenColMetaData, TokenColName, TokenDone,
         TokenEnvChange, TokenError, TokenFedAuthInfo, TokenFeatureExtAck, TokenInfo, TokenLoginAck,
         TokenOrder, TokenReturnValue, TokenRow, TokenSessionState, TokenSspi, TokenTabName,
-        TypeInfo, TypeLength, TvpColumn, TvpData, TvpInfo, UdtInfo, VarLenContext, VarLenType,
-        VariantData,
+        TypeInfo, TypeLength, TvpColumn, TvpData, TvpInfo, UdtData, UdtInfo, VarLenContext,
+        VarLenType, VariantData,
     },
     numeric,
     stream::QueryStream,

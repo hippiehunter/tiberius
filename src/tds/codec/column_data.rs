@@ -84,6 +84,48 @@ pub enum ColumnData<'a> {
     Tvp(Option<TvpData<'a>>),
 }
 
+/// Opaque CLR user-defined type payload.
+///
+/// This is distinct from normal SQL binary data. Use it to read UDT columns
+/// such as `hierarchyid` as raw serialized bytes while inspecting type
+/// metadata through [`Column::udt_info`].
+///
+/// # Example
+///
+/// ```no_run
+/// # use tiberius::{Client, Config, UdtData};
+/// # use tokio::net::TcpStream;
+/// # use tokio_util::compat::TokioAsyncWriteCompatExt;
+/// # #[tokio::main]
+/// # async fn main() -> anyhow::Result<()> {
+/// # let config = Config::from_ado_string(
+/// #     "server=tcp:localhost,1433;IntegratedSecurity=true;TrustServerCertificate=true",
+/// # )?;
+/// # let tcp = TcpStream::connect(config.get_addr()).await?;
+/// # tcp.set_nodelay(true)?;
+/// # let mut client = Client::connect(config, tcp.compat_write()).await?;
+/// let row = client
+///     .query("SELECT CAST('/1/2/' AS hierarchyid) AS hid", &[])
+///     .await?
+///     .into_row()
+///     .await?
+///     .unwrap();
+///
+/// let hid: Option<UdtData<'_>> = row.get("hid");
+/// assert!(hid.as_ref().map(UdtData::as_bytes).is_some());
+///
+/// let info = row.columns()[0].udt_info().unwrap();
+/// assert_eq!(info.type_name, "hierarchyid");
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`Column::udt_info`]: crate::Column::udt_info
+#[derive(Clone, Debug, PartialEq)]
+pub struct UdtData<'a> {
+    bytes: Cow<'a, [u8]>,
+}
+
 /// Opaque sql_variant payload (base type + prop bytes + value bytes).
 #[derive(Clone, Debug, PartialEq)]
 pub struct VariantData<'a> {
@@ -174,6 +216,33 @@ impl<'a> TvpData<'a> {
     pub fn rows(mut self, rows: Vec<Vec<ColumnData<'a>>>) -> Self {
         self.rows = rows;
         self
+    }
+}
+
+impl<'a> UdtData<'a> {
+    /// Create a new UDT payload from raw serialized bytes.
+    pub fn new(bytes: impl Into<Cow<'a, [u8]>>) -> Self {
+        Self {
+            bytes: bytes.into(),
+        }
+    }
+
+    /// Return the raw serialized UDT bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+
+    /// Convert the payload into an owned `'static` value.
+    pub fn into_owned(self) -> UdtData<'static> {
+        UdtData {
+            bytes: Cow::Owned(self.bytes.into_owned()),
+        }
+    }
+}
+
+impl AsRef<[u8]> for UdtData<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
@@ -1602,6 +1671,12 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                 for (i, byte) in bytes.iter().enumerate() {
                     dst[len_pos + i] = *byte;
                 }
+            }
+            (ColumnData::String(None), None) => {
+                dst.put_u8(VarLenType::NVarchar as u8);
+                dst.put_u16_le(8000);
+                dst.extend_from_slice(&[0u8; 5][..]);
+                dst.put_u16_le(0xffff);
             }
             (ColumnData::String(Some(ref s)), None) => {
                 // length: 0xffff and raw collation
@@ -3316,6 +3391,28 @@ mod tests {
         // IntoSql
         let cd = tvp.into_sql();
         assert!(matches!(cd, ColumnData::Tvp(Some(_))));
+    }
+
+    /// Test FromSql / FromSqlOwned for UdtData.
+    #[tokio::test]
+    async fn udt_from_sql() {
+        use crate::{FromSql, FromSqlOwned, UdtData};
+
+        let cd = ColumnData::Udt(Some(vec![9, 8, 7].into()));
+
+        let result: Option<UdtData<'_>> = UdtData::from_sql(&cd).unwrap();
+        assert_eq!(result.unwrap().as_bytes(), &[9, 8, 7]);
+
+        let result: Option<UdtData<'static>> = UdtData::from_sql_owned(cd).unwrap();
+        assert_eq!(result.unwrap().as_bytes(), &[9, 8, 7]);
+
+        let null = ColumnData::Udt(None);
+        let result: Option<UdtData<'_>> = UdtData::from_sql(&null).unwrap();
+        assert!(result.is_none());
+
+        let bytes = ColumnData::Udt(Some(vec![1, 2, 3].into()));
+        assert!(<&[u8]>::from_sql(&bytes).is_err());
+        assert!(Vec::<u8>::from_sql_owned(bytes).is_err());
     }
 
     /// Test FromSql / FromSqlOwned for VariantData.
